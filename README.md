@@ -1,6 +1,6 @@
 # aur-packages
 
-PKGBUILDs for [DawnMagnet](https://aur.archlinux.org/packages?K=DawnMagnet&SeB=m)'s AUR packages. GitHub Actions checks upstream every 6 hours, test-builds in `archlinux:base-devel`, and publishes only when that build succeeds.
+PKGBUILDs for [DawnMagnet](https://aur.archlinux.org/packages?K=DawnMagnet&SeB=m)'s AUR packages. GitHub Actions checks upstream every 2 days, test-builds in `archlinux:base-devel`, and publishes only when that build succeeds.
 
 | Package | Kind | Upstream | Automation |
 | --- | --- | --- | --- |
@@ -19,7 +19,7 @@ The hearthstone directories are disabled with `.aur-disabled` and are absent fro
 
 `.github/workflows/update-aur.yml` runs:
 
-- on the schedule `0 */6 * * *` (00:00, 06:00, 12:00, 18:00 UTC; GitHub may start the job late)
+- on the schedule `0 0 */2 * *` (00:00 UTC on odd days of the month; GitHub may start the job late)
 - on `workflow_dispatch`
 - on a push to `main` that touches a package directory, `nvchecker.toml`, `scripts/`, or the workflow file
 

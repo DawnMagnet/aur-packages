@@ -2,8 +2,8 @@ name: Update AUR packages
 
 on:
   schedule:
-    # Every 6 hours. GitHub may delay scheduled runs.
-    - cron: "0 */6 * * *"
+    # Every 2 days at 00:00 UTC (odd days of the month). GitHub may delay scheduled runs.
+    - cron: "0 0 */2 * *"
   workflow_dispatch:
   push:
     branches: [main]
