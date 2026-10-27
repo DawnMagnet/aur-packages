@@ -1,0 +1,21 @@
+pkgbase = memprocfs
+	pkgdesc = MemProcFS is an easy and convenient way of viewing physical memory as files in a virtual file system.
+	pkgver = 5.16.14
+	pkgrel = 20260211
+	url = https://github.com/ufrisk/MemProcFS
+	arch = x86_64
+	arch = aarch64
+	license = GPL3
+	depends = fuse
+	depends = lz4
+	depends = openssl
+	depends = libusb
+	optdepends = python: for python bindings
+	provides = memprocfs
+	options = !strip
+	source_x86_64 = https://github.com/ufrisk/MemProcFS/releases/download/v5.16/MemProcFS_files_and_binaries_v5.16.14-linux_x64-20260211.tar.gz
+	sha256sums_x86_64 = bc7ea472af63894b15ff6ebc93d62cdf35d3e802e9db157598fef79a4737af0b
+	source_aarch64 = https://github.com/ufrisk/MemProcFS/releases/download/v5.16/MemProcFS_files_and_binaries_v5.16.14-linux_aarch64-20260211.tar.gz
+	sha256sums_aarch64 = e554ee5eddd5ba5752ab32ab55c782aff450e6b8230db333f425545a8a166358
+
+pkgname = memprocfs

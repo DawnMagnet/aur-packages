@@ -1,0 +1,13 @@
+pkgbase = asus-fa401km-acpi-fix
+	pkgdesc = Fix slow boot (36s delay) for ASUS TUF Air 2025 (FA401KM) via DSDT override
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://www.bilibili.com/opus/1104887054270988297
+	install = asus-fa401km-acpi-fix.install
+	arch = x86_64
+	license = unknown
+	depends = mkinitcpio
+	source = dsdt.aml::https://gist.githubusercontent.com/HiFiPhile/324c330b204ef038ef8b3ff2aff7bb6c/raw/791afbad504a61e28738a6ad147f08471d1a583a/dsdt.aml
+	sha256sums = 71794b35aa86d3a1accc54eb8cbf93f27454386ce53551d2c579daafa9519905
+
+pkgname = asus-fa401km-acpi-fix

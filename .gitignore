@@ -1,0 +1,17 @@
+# nvchecker state and credentials
+old_ver.json
+new_ver.json
+nvchecker-keyfile.toml
+
+# updater bookkeeping
+**/.update-old-version
+
+# makepkg products
+**/src/
+**/pkg/
+**/*.pkg.tar*
+**/*.pkg.tar*.sig
+**/*.log
+
+__pycache__/
+*.pyc

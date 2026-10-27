@@ -1,0 +1,3 @@
+DISABLED: do not push to the AUR.
+DawnMagnet does not maintain hearthstone-linux-gui-appimage yet.
+Remove this file and add the package to .github/workflows/update-aur.yml after adopting it.

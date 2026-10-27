@@ -1,0 +1,95 @@
+name: Update AUR packages
+
+on:
+  schedule:
+    # Every 6 hours. GitHub may delay scheduled runs.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "maple-mono-nf-cn/**"
+      - "memprocfs/**"
+      - "moonbit-bin/**"
+      - "cuda-api-wrappers-git/**"
+      - "reflectcpp-git/**"
+      - "nvchecker.toml"
+      - "scripts/**"
+      - ".github/workflows/update-aur.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    name: ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    concurrency:
+      group: aur-update-${{ matrix.package }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: maple-mono-nf-cn
+            timeout: 45
+          - package: memprocfs
+            timeout: 45
+          - package: moonbit-bin
+            timeout: 60
+          - package: cuda-api-wrappers-git
+            timeout: 180
+            free_disk: true
+          - package: reflectcpp-git
+            timeout: 120
+          # hearthstone-linux-gui-bin and hearthstone-linux-gui-appimage are
+          # prepared in this repo but omitted until those AUR packages are adopted.
+          # asus-fa401km-acpi-fix has no upstream version and is not updated.
+
+    steps:
+      - name: Checkout latest main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Free disk space
+        if: ${{ matrix.free_disk }}
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/.ghcup || true
+          df -h
+
+      - name: Install nvchecker
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install 'nvchecker>=2.19'
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Update package files
+        id: upd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/update_package.py "${{ matrix.package }}"
+
+      - name: Show update diff
+        if: steps.upd.outputs.changed == 'true'
+        run: git diff -- "${{ matrix.package }}"
+
+      - name: Test build
+        if: steps.upd.outputs.changed == 'true'
+        run: bash scripts/test_build.sh "${{ matrix.package }}"
+
+      - name: Publish
+        if: steps.upd.outputs.changed == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: bash scripts/publish.sh "${{ matrix.package }}"

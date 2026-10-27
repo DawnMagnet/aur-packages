@@ -1,0 +1,19 @@
+pkgbase = hearthstone-linux-gui-bin
+	pkgdesc = Native GTK4 Linux GUI manager for installing, logging into, and launching Hearthstone
+	pkgver = 0.3.2
+	pkgrel = 1
+	url = https://github.com/DawnMagnet/hearthstone-linux-gui
+	arch = x86_64
+	license = MIT
+	depends = glibc
+	depends = gtk4
+	depends = libadwaita
+	depends = glib2
+	depends = pango
+	depends = xdg-utils
+	provides = hearthstone-linux-gui
+	conflicts = hearthstone-linux-gui
+	source = https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.3.2/hearthstone-linux-gui-0.3.2-1-x86_64.pkg.tar.zst
+	sha256sums = e8da8dd49a2e498a66c226bff707c84f818576e8541f04a0f153a4a434c36109
+
+pkgname = hearthstone-linux-gui-bin

@@ -1,0 +1,18 @@
+pkgbase = hearthstone-linux-gui-appimage
+	pkgdesc = Native GTK4 Linux GUI manager for installing, logging into, and launching Hearthstone (AppImage)
+	pkgver = 0.3.2
+	pkgrel = 1
+	url = https://github.com/DawnMagnet/hearthstone-linux-gui
+	arch = x86_64
+	license = MIT
+	depends = fuse2
+	depends = zlib
+	depends = hicolor-icon-theme
+	provides = hearthstone-linux-gui
+	conflicts = hearthstone-linux-gui
+	conflicts = hearthstone-linux-gui-bin
+	options = !strip
+	source = https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.3.2/hearthstone-linux-gui-0.3.2-x86_64.AppImage
+	sha256sums = 4dce26a3ce6c7b2abb6e43b22152c339339b303e6ac1d651f1f4638844e7d8f2
+
+pkgname = hearthstone-linux-gui-appimage

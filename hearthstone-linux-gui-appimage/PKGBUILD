@@ -1,0 +1,20 @@
+# DISABLED — not pushed to the AUR. DawnMagnet does not maintain this package yet.
+# Remove .aur-disabled and add the name to the workflow matrix after adopting it.
+pkgname=hearthstone-linux-gui-appimage
+pkgver=0.3.2
+pkgrel=1
+pkgdesc="Native GTK4 Linux GUI manager for installing, logging into, and launching Hearthstone (AppImage)"
+arch=('x86_64')
+url="https://github.com/DawnMagnet/hearthstone-linux-gui"
+license=('MIT')
+depends=('fuse2' 'zlib' 'hicolor-icon-theme')
+provides=('hearthstone-linux-gui')
+conflicts=('hearthstone-linux-gui' 'hearthstone-linux-gui-bin')
+options=('!strip')
+source=("https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v${pkgver}/hearthstone-linux-gui-${pkgver}-x86_64.AppImage")
+sha256sums=('4dce26a3ce6c7b2abb6e43b22152c339339b303e6ac1d651f1f4638844e7d8f2')
+
+package() {
+  install -Dm755 "${srcdir}/hearthstone-linux-gui-${pkgver}-x86_64.AppImage" \
+    "${pkgdir}/usr/bin/hearthstone-linux-gui"
+}

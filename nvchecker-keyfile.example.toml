@@ -1,0 +1,4 @@
+# Copy to nvchecker-keyfile.toml (gitignored) or let scripts/update_package.py
+# create that file from GITHUB_TOKEN / `gh auth token`.
+[keys]
+github = "ghp_your_token_here"

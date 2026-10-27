@@ -1,0 +1,60 @@
+# Declarative upstream versions for packages this repo publishes.
+# GitHub entries use the token in nvchecker-keyfile.toml ([keys] github = "..."),
+# generated in CI from GITHUB_TOKEN. Do not commit a real token.
+#
+# VCS packages (-git) record the latest stable tag here. The AUR pkgver is not
+# that tag: scripts/update_package.py runs the PKGBUILD pkgver() transform
+# (git describe) so the AUR page shows the current commit.
+#
+# memprocfs and moonbit-bin use cmd sources because their version is not the
+# GitHub tag (asset build+date, or `moon version` inside the latest tarball).
+
+[__config__]
+oldver = "old_ver.json"
+newver = "new_ver.json"
+keyfile = "nvchecker-keyfile.toml"
+
+[maple-mono-nf-cn]
+source = "github"
+github = "subframe7536/maple-font"
+use_latest_release = true
+prefix = "v"
+exclude_regex = ".*(alpha|beta|rc|pre).*"
+
+[memprocfs]
+source = "cmd"
+cmd = "python3 scripts/nvchecker_memprocfs.py"
+
+[moonbit-bin]
+source = "cmd"
+cmd = "python3 scripts/nvchecker_moonbit.py"
+
+[cuda-api-wrappers-git]
+source = "github"
+github = "eyalroz/cuda-api-wrappers"
+use_latest_release = true
+prefix = "v"
+exclude_regex = ".*(alpha|beta|rc|pre).*"
+
+[reflectcpp-git]
+source = "github"
+github = "getml/reflect-cpp"
+use_latest_release = true
+prefix = "v"
+exclude_regex = ".*(alpha|beta|rc|pre).*"
+
+# Not published. DawnMagnet does not maintain these AUR packages yet.
+# Uncomment after adopting them, add the directories to the workflow matrix,
+# and delete their .aur-disabled files.
+#
+# [hearthstone-linux-gui-bin]
+# source = "github"
+# github = "DawnMagnet/hearthstone-linux-gui"
+# use_latest_release = true
+# prefix = "v"
+#
+# [hearthstone-linux-gui-appimage]
+# source = "github"
+# github = "DawnMagnet/hearthstone-linux-gui"
+# use_latest_release = true
+# prefix = "v"

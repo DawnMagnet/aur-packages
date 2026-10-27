@@ -1,0 +1,20 @@
+# DISABLED — not pushed to the AUR. DawnMagnet does not maintain this package yet.
+# Remove .aur-disabled and add the name to the workflow matrix after adopting it.
+# Upstream already publishes an Arch package; this -bin package unpacks it.
+pkgname=hearthstone-linux-gui-bin
+pkgver=0.3.2
+pkgrel=1
+pkgdesc="Native GTK4 Linux GUI manager for installing, logging into, and launching Hearthstone"
+arch=('x86_64')
+url="https://github.com/DawnMagnet/hearthstone-linux-gui"
+license=('MIT')
+depends=('glibc' 'gtk4' 'libadwaita' 'glib2' 'pango' 'xdg-utils')
+provides=('hearthstone-linux-gui')
+conflicts=('hearthstone-linux-gui')
+source=("https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v${pkgver}/hearthstone-linux-gui-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst")
+sha256sums=('e8da8dd49a2e498a66c226bff707c84f818576e8541f04a0f153a4a434c36109')
+
+package() {
+  tar --zstd -xf "${srcdir}/hearthstone-linux-gui-${pkgver}-${pkgrel}-x86_64.pkg.tar.zst" -C "$pkgdir"
+  rm -f "$pkgdir"/.PKGINFO "$pkgdir"/.MTREE "$pkgdir"/.BUILDINFO "$pkgdir"/.INSTALL
+}
