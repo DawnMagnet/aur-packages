@@ -373,7 +373,8 @@ def update_moonbit() -> None:
     mark_changed("moonbit-bin", old_full, new_full)
 
 
-def git_pkgver(url: str, describe_args: list[str]) -> str:
+def git_pkgver(url: str, describe_args: list[str]) -> tuple[str, str]:
+    """Return (pkgver, full commit hash) for the default branch of url."""
     tmp = Path(tempfile.mkdtemp(prefix="pkgver-"))
     try:
         subprocess.check_call(
@@ -385,6 +386,9 @@ def git_pkgver(url: str, describe_args: list[str]) -> str:
             cwd=tmp / "src",
             text=True,
         ).strip()
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=tmp / "src", text=True
+        ).strip()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     # Same transform as the PKGBUILD pkgver() functions.
@@ -395,18 +399,28 @@ def git_pkgver(url: str, describe_args: list[str]) -> str:
     ).strip()
     if not pkgver or not re.fullmatch(r"[A-Za-z0-9._+]+", pkgver):
         raise SystemExit(f"refusing pkgver {pkgver!r} from git describe {described!r}")
-    return pkgver
+    return pkgver, head
+
+
+GIT_HASH_RE = re.compile(r"\.g([0-9a-f]{4,40})$")
+
+
+def same_commit(old_ver: str, head: str) -> bool:
+    """git describe abbreviates hashes to a length that can change between
+    clones (7 vs 8 hex digits), so compare the commit, not the string."""
+    match = GIT_HASH_RE.search(old_ver)
+    return bool(match) and head.startswith(match.group(1))
 
 
 def update_git(pkg: str, url: str) -> None:
     nvchecker_version(pkg)
-    new_ver = git_pkgver(url, ["--long", "--tags"])
+    new_ver, head = git_pkgver(url, ["--long", "--tags"])
     text = read_pkgbuild(pkg)
     old_ver = read_var(text, "pkgver")
     old_rel = read_var(text, "pkgrel")
     old_full = full_version(old_ver, old_rel)
     new_full = full_version(new_ver, "1")
-    if new_ver == old_ver:
+    if new_ver == old_ver or same_commit(old_ver, head):
         mark_unchanged(pkg, old_full)
         return
     require_newer(pkg, old_full, new_full)
