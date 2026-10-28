@@ -318,7 +318,20 @@ def update_memprocfs() -> None:
     mark_changed("memprocfs", old_full, new_full)
 
 
-MOON_SANDBOX_IMAGE = "archlinux:base-devel"
+# Digest-pinned archlinux:base-devel, shared with test_build.sh and
+# regen_srcinfo.sh. Bump the digest in scripts/archlinux-image.
+ARCH_IMAGE_FILE = Path(__file__).resolve().parent / "archlinux-image"
+ARCH_IMAGE_RE = re.compile(r"^archlinux:base-devel@sha256:[0-9a-f]{64}$")
+
+
+def arch_image() -> str:
+    image = ARCH_IMAGE_FILE.read_text(encoding="utf-8").strip()
+    if not ARCH_IMAGE_RE.fullmatch(image):
+        raise SystemExit(f"{ARCH_IMAGE_FILE.name} must be archlinux:base-devel@sha256:<digest>, not {image!r}")
+    return image
+
+
+MOON_SANDBOX_IMAGE = arch_image()
 
 
 def moon_version_sandboxed(bindir: Path) -> str:

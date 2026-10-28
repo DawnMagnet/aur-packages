@@ -42,12 +42,17 @@ rm -f "$copy/pkg/.SRCINFO" "$copy/pkg/.update-old-version"
 
 unset GITHUB_TOKEN GH_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN || true
 
-docker pull archlinux:base-devel
+image="$(<"$repo/scripts/archlinux-image")"
+if [[ ! "$image" =~ ^archlinux:base-devel@sha256:[0-9a-f]{64}$ ]]; then
+  echo "scripts/archlinux-image must be archlinux:base-devel@sha256:<digest>" >&2
+  exit 1
+fi
+docker pull "$image"
 docker run --rm \
   -e LANG=C \
   -v "$copy/pkg:/pkg" \
   -w /pkg \
-  archlinux:base-devel \
+  "$image" \
   bash -c 'set -euo pipefail; id builder >/dev/null 2>&1 || useradd -m builder; chown -R builder:builder /pkg; runuser -u builder -- makepkg --holdver --printsrcinfo' \
   > "$copy/SRCINFO"
 

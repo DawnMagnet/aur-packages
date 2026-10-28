@@ -164,6 +164,31 @@ class StageTest(unittest.TestCase):
 
 
 class ImportTest(unittest.TestCase):
+    def test_import_rejects_unregistered_packages(self) -> None:
+        cases = {
+            "foo-bin": "RELEASE_PACKAGES",
+            "foo-git": "GIT_REPOS",
+            "asus-fa401km-acpi-fix": "RELEASE_PACKAGES",
+        }
+        for package, registry in cases.items():
+            for status in ("publish", "skip"):
+                with self.subTest(package=package, status=status), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    artifact = root / "artifact"
+                    if status == "publish":
+                        write_pkgbuild(artifact, BASELINE.replace("maple-mono-nf-cn", package))
+                        gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+                    else:
+                        artifact.mkdir()
+                        gate.write_manifest(artifact, "skip", {})
+                    dest = root / package
+                    dest.mkdir()
+                    (dest / "PKGBUILD").write_text("keep\n", encoding="utf-8")
+                    with self.assertRaises(SystemExit) as caught:
+                        gate.import_artifact(package, artifact, dest)
+                    self.assertIn(registry, str(caught.exception))
+                    self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), "keep\n")
+
     def test_import_replaces_pkgbuild_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -502,11 +527,13 @@ class ImportTest(unittest.TestCase):
             gate.import_artifact("moonbit-bin", stage, dest)
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), self.MOONBIT)
 
-    def test_unlisted_non_git_package_is_unchanged_without_expected_pkgver(self) -> None:
+    def test_unlisted_non_git_package_is_refused(self) -> None:
+        # It used to pass with no pkgver/pkgrel/source checks at all.
         old = "pkgname=asus-fa401km-acpi-fix\npkgver=1.0.0\npkgrel=1\n" f"sha256sums=('{H1}')\n"
         new = old.replace("pkgrel=1", "pkgrel=2").replace(H1, H3)
-        dest = self.import_release(old, new)
-        self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), new)
+        with self.assertRaises(SystemExit) as caught:
+            self.import_release(old, new)
+        self.assertIn("RELEASE_PACKAGES", str(caught.exception))
 
     def test_cli_passes_expected_pkgrel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,7 +6,7 @@ bump (for example moonbit-bin pkgrel 1 -> 2) therefore reported changed=false
 and was never pushed. The build job runs this right after update_package.py:
 
   repo newer than AUR (alpm vercmp)  -> changed=true
-  package missing on AUR             -> changed=true
+  package missing on AUR             -> exit 1 (create it on the AUR first)
   repo equal to AUR                  -> changed unchanged
   AUR newer than repo                -> exit 1 with a clear message
   RPC failed after retries           -> changed unchanged (see below)
@@ -40,7 +40,8 @@ from alpmver import vercmp
 from update_package import read_var, same_pkgver_commit, set_output
 
 RPC_URL = "https://aur.archlinux.org/rpc/v5/info"
-TIMEOUT = 15
+# Worst case per package when the AUR is down: 3 x 10 s + 2 s + 4 s = 36 s.
+TIMEOUT = 10
 ATTEMPTS = 3
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
 # [epoch:]pkgver-pkgrel as the AUR reports it.
@@ -152,7 +153,11 @@ def same_version(package: str, repo: str, aur: str) -> bool:
 def decide(package: str, changed: bool, repo: str, aur: str | None) -> tuple[bool, str]:
     """Return (changed, reason). Raises SystemExit when the AUR is newer."""
     if aur is None:
-        return True, f"{package} is not on the AUR; treating as changed"
+        raise SystemExit(
+            f"{package}: the AUR RPC reports no such package. This workflow only "
+            "updates packages that already exist on the AUR; create it there by "
+            "hand (or fix the package name) before the workflow can publish it."
+        )
     if same_version(package, repo, aur):
         return changed, f"{package} repo {repo} matches AUR {aur}"
     if vercmp(repo, aur) > 0:
