@@ -22,8 +22,7 @@ BASELINE = f"""pkgname=maple-mono-nf-cn
 pkgver=7.9
 pkgrel=1
 source=("https://example.invalid/MapleMono.zip")
-sha256sums=('{H1}'
-            '{H2}')
+sha256sums=('{H1}')
 """
 
 
@@ -32,6 +31,18 @@ def sources_of(pkgbuild: str) -> str:
     import json
 
     return json.dumps(gate.parse_sources("test", pkgbuild))
+
+
+def sums_of(pkgbuild: str) -> str:
+    """The --expected-sha256sums value an honest host would compute.
+
+    Tests inject it from the artifact itself; the real value comes from
+    host_sha256sums downloading every source (see test_host_release.py).
+    """
+    import json
+
+    sums = gate.parse_checksums("test", pkgbuild)
+    return json.dumps({k: v for k, v in sums.items() if k.startswith("sha256sums")})
 
 
 def write_pkgbuild(directory: Path, pkgbuild: str) -> None:
@@ -199,7 +210,7 @@ class ImportTest(unittest.TestCase):
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
             (dest / ".SRCINFO").write_text("old\n", encoding="utf-8")
             (dest / "extra.txt").write_text("keep\n", encoding="utf-8")
-            gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE))
+            gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE), sums_of(updated))
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), updated)
             self.assertEqual((dest / ".SRCINFO").read_text(encoding="utf-8"), "old\n")
             self.assertEqual((dest / "extra.txt").read_text(encoding="utf-8"), "keep\n")
@@ -213,7 +224,7 @@ class ImportTest(unittest.TestCase):
             current = BASELINE.replace("pkgver=7.9", "pkgver=8.0")
             (dest / "PKGBUILD").write_text(current, encoding="utf-8")
             with self.assertRaises(SystemExit) as caught:
-                gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE))
+                gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE), sums_of(BASELINE))
             self.assertIn("older", str(caught.exception))
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), current)
 
@@ -232,7 +243,7 @@ class ImportTest(unittest.TestCase):
             dest = root / "memprocfs"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(old, encoding="utf-8")
-            gate.import_artifact("memprocfs", artifact, dest, "5.19.0", None, "20261101", sources_of(new))
+            gate.import_artifact("memprocfs", artifact, dest, "5.19.0", None, "20261101", sources_of(new), sums_of(new))
             self.assertIn("new.tar.gz", (dest / "PKGBUILD").read_text(encoding="utf-8"))
 
     def test_import_rejects_shell_in_source_and_srcinfo_payload(self) -> None:
@@ -445,7 +456,7 @@ class ImportTest(unittest.TestCase):
         'source=("https://cli.moonbitlang.cn/binaries/latest/moonbit-linux-x86_64.tar.gz#filename=${pkgname}-${pkgver}-linux-x86_64.tar.gz"\n'
         '  "https://cli.moonbitlang.cn/cores/core-latest.tar.gz#filename=moonbit-core-${pkgver}.tar.gz"\n'
         '  "moon.sh")\n'
-        f"sha256sums=('{H1}')\n"
+        f"sha256sums=('{H1}'\n            '{H2}'\n            '{H2}')\n"
     )
 
     def import_release(self, current: str, updated: str, *expected) -> Path:
@@ -461,7 +472,7 @@ class ImportTest(unittest.TestCase):
         (dest / "PKGBUILD").write_text(current, encoding="utf-8")
         self.dest = dest
         if len(expected) == 3:
-            expected = (*expected, sources_of(updated))
+            expected = (*expected, sources_of(updated), sums_of(updated))
         gate.import_artifact(package, artifact, dest, *expected)
         return dest
 
@@ -547,7 +558,8 @@ class ImportTest(unittest.TestCase):
             argv = ["publish_artifact.py", "import", "--package", "moonbit-bin",
                     "--artifact", str(artifact), "--dest", str(dest),
                     "--expected-pkgver", "0.1.20261023", "--expected-commit", "",
-                    "--expected-sources", sources_of(self.MOONBIT)]
+                    "--expected-sources", sources_of(self.MOONBIT),
+                    "--expected-sha256sums", sums_of(self.MOONBIT)]
             with self.assertRaises(SystemExit) as caught:
                 gate.main(argv + ["--expected-pkgrel", "1"])
             self.assertIn("pkgrel 2 does not match", str(caught.exception))
@@ -678,7 +690,7 @@ class GitCommitPkgverTest(unittest.TestCase):
             dest = root / "maple-mono-nf-cn"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
-            gate.import_artifact("maple-mono-nf-cn", nested, dest, "7.9", None, "1", sources_of(BASELINE))
+            gate.import_artifact("maple-mono-nf-cn", nested, dest, "7.9", None, "1", sources_of(BASELINE), sums_of(BASELINE))
             self.assertFalse((dest / ".SRCINFO").exists())
 
     def test_manifest_hash_mismatch_is_rejected(self) -> None:
