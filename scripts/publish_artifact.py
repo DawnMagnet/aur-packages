@@ -607,6 +607,29 @@ def expect_release(package: str, artifact: Path, main_pkgbuild: Path) -> None:
     set_output("sources", json.dumps(sources, separators=(",", ":"), sort_keys=True))
 
 
+def require_registered(package: str) -> None:
+    """Refuse a package this repo does not know how to check.
+
+    Import pins pkgver, pkgrel and source arrays only for -git packages with a
+    known upstream (update_package.GIT_REPOS) and for update_package's
+    RELEASE_PACKAGES. Anything else would skip those checks and publish
+    unverified, so a new package that was never registered fails loudly here,
+    even when its artifact is only a skip marker.
+    """
+    if package.endswith("-git"):
+        if package not in update_package.GIT_REPOS:
+            die(
+                f"{package}: -git package has no upstream in update_package.GIT_REPOS; "
+                "register it before it can be imported"
+            )
+        return
+    if package not in update_package.RELEASE_PACKAGES:
+        die(
+            f"{package}: not a -git package and not in update_package.RELEASE_PACKAGES; "
+            "register it before it can be imported"
+        )
+
+
 def import_artifact(
     package: str,
     artifact: Path,
@@ -617,6 +640,7 @@ def import_artifact(
     expected_sources: str | None = None,
 ) -> None:
     validate_package(package)
+    require_registered(package)
     if dest.is_symlink() or not dest.is_dir():
         die("dest must be the package directory")
     dest = dest.resolve()

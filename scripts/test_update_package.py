@@ -13,6 +13,19 @@ import update_package as up
 ROOT = Path(__file__).resolve().parent.parent
 
 
+class ArchImageTest(unittest.TestCase):
+    def test_image_is_digest_pinned_and_shared(self) -> None:
+        self.assertRegex(up.MOON_SANDBOX_IMAGE, r"^archlinux:base-devel@sha256:[0-9a-f]{64}$")
+        scripts = Path(up.__file__).resolve().parent
+        for name in ("test_build.sh", "regen_srcinfo.sh"):
+            text = (scripts / name).read_text(encoding="utf-8")
+            self.assertIn("scripts/archlinux-image", text)
+            for line in text.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue
+                self.assertNotRegex(line, r"archlinux:base-devel\s*(\\|$)", f"{name}: {line}")
+
+
 class UpdatePackageTest(unittest.TestCase):
     def test_self_check(self) -> None:
         proc = subprocess.run(

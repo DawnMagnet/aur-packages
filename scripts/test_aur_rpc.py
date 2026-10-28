@@ -166,9 +166,21 @@ class CompareTest(unittest.TestCase):
     def test_upstream_change_stays_changed_when_equal(self) -> None:
         self.assertTrue(self.run_compare("moonbit-bin", self.MOONBIT, True, "0.1.20261023-2"))
 
-    def test_missing_on_aur_is_changed(self) -> None:
-        self.assertTrue(self.run_compare("moonbit-bin", self.MOONBIT, False, None))
-        self.assertEqual(self.outputs(), {"changed": "true", "aur_version": ""})
+    def test_missing_on_aur_fails(self) -> None:
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                d = self.root / "moonbit-bin"
+                if d.exists():
+                    (d / "PKGBUILD").unlink()
+                    d.rmdir()
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_compare("moonbit-bin", self.MOONBIT, changed, None)
+                self.assertIn("no such package", str(caught.exception))
+                self.assertNotIn("changed", self.outputs())
+
+    def test_worst_case_wait_when_aur_is_down(self) -> None:
+        waits = sum(2 * a for a in range(1, aur_rpc.ATTEMPTS))
+        self.assertLessEqual(aur_rpc.ATTEMPTS * aur_rpc.TIMEOUT + waits, 36)
 
     def test_aur_newer_fails_with_clear_message(self) -> None:
         for changed in (False, True):

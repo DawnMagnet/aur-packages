@@ -54,7 +54,12 @@ trap cleanup EXIT
 
 unset GITHUB_TOKEN GH_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_RUNTIME_TOKEN || true
 
-docker pull archlinux:base-devel
+image="$(<"$repo/scripts/archlinux-image")"
+if [[ ! "$image" =~ ^archlinux:base-devel@sha256:[0-9a-f]{64}$ ]]; then
+  echo "scripts/archlinux-image must be archlinux:base-devel@sha256:<digest>" >&2
+  exit 1
+fi
+docker pull "$image"
 docker run --rm \
   -e HOST_UID="$(id -u)" \
   -e HOST_GID="$(id -g)" \
@@ -62,7 +67,7 @@ docker run --rm \
   -v "$pkgdir:/pkg:ro" \
   -v "$script:/build_in_arch.sh:ro" \
   -v "$work_seal:/work" \
-  archlinux:base-devel \
+  "$image" \
   bash /build_in_arch.sh seal "$pkg" /pkg /work
 
 if [[ -L "$work_seal/result/PKGBUILD" || ! -f "$work_seal/result/PKGBUILD" ]]; then
@@ -103,7 +108,7 @@ docker run --rm \
   -e LANG=C \
   -v "$script:/build_in_arch.sh:ro" \
   -v "$work_build/pkg:/pkg" \
-  archlinux:base-devel \
+  "$image" \
   bash /build_in_arch.sh build "$pkg" /pkg
 
 out="${AUR_BUILD_OUT:-}"

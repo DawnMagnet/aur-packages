@@ -105,9 +105,9 @@ jobs:
         if: steps.upd.outputs.changed == 'true'
         run: git diff -- "${{ matrix.package }}"
 
-      # Read-only AUR RPC lookup. A repo version newer than the AUR (or a
-      # package missing on the AUR) is treated as changed; an AUR version
-      # newer than the repo fails the job. If the RPC cannot be read, the
+      # Read-only AUR RPC lookup. A repo version newer than the AUR is
+      # treated as changed; an AUR version newer than the repo, or a package
+      # missing on the AUR, fails the job. If the RPC cannot be read, the
       # comparison is skipped and changed stays as update_package.py set it,
       # so the RPC alone never triggers a publish.
       - name: Compare with the AUR
