@@ -1,0 +1,66 @@
+# Monthly reminder to bump the digest-pinned Arch build image.
+#
+# Dependabot cannot track scripts/archlinux-image. This job reads the current
+# archlinux:base-devel index digest from Docker Hub's official
+# library/archlinux repository and, if it differs from the pinned one, opens
+# (or updates) a single reminder issue. It never changes the repository: the
+# digest bump is a normal PR that goes through review.
+name: Arch image digest
+
+on:
+  schedule:
+    - cron: "17 3 1 * *" # 03:17 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: arch-digest
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check archlinux:base-devel digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare with Docker Hub
+        id: digest
+        run: bash scripts/check_arch_digest.sh
+
+      - name: Open or update the reminder issue
+        if: steps.digest.outputs.status == 'outdated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PINNED: ${{ steps.digest.outputs.pinned }}
+          LATEST: ${{ steps.digest.outputs.latest }}
+        run: |
+          set -euo pipefail
+          re='^archlinux:base-devel@sha256:[0-9a-f]{64}$'
+          [[ "$PINNED" =~ $re && "$LATEST" =~ $re ]] || { echo "malformed digest output" >&2; exit 1; }
+          title="Arch build image digest is outdated"
+          body="$(printf '%s\n' \
+            "Docker Hub's official \`library/archlinux:base-devel\` has a new index digest." \
+            "" \
+            "- pinned: \`${PINNED}\`" \
+            "- latest: \`${LATEST}\`" \
+            "" \
+            "Open a PR that sets \`scripts/archlinux-image\` to the latest value; it goes through the usual review." \
+            "Checked by run ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}.")"
+          existing="$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number,title |
+            jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')"
+          if [[ -n "$existing" ]]; then
+            gh issue edit "$existing" -R "$REPO" --body "$body"
+            echo "updated issue #$existing"
+          else
+            gh issue create -R "$REPO" --title "$title" --body "$body"
+          fi

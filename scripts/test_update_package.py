@@ -14,6 +14,20 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class ArchImageTest(unittest.TestCase):
+    def test_check_arch_digest_refuses_a_malformed_pin(self) -> None:
+        import shutil, tempfile
+        scripts = Path(up.__file__).resolve().parent
+        for bad in ("archlinux:base-devel", "archlinux:base-devel@sha256:" + "A" * 64, "evil/archlinux:base-devel@sha256:" + "0" * 64):
+            with self.subTest(bad=bad), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "scripts").mkdir()
+                shutil.copy(scripts / "check_arch_digest.sh", Path(tmp) / "scripts")
+                (Path(tmp) / "scripts" / "archlinux-image").write_text(bad + "\n", encoding="utf-8")
+                env = {"PATH": "/usr/bin:/bin", "HOME": tmp}
+                proc = subprocess.run(["/bin/bash", str(Path(tmp) / "scripts" / "check_arch_digest.sh")],
+                                      capture_output=True, text=True, env=env)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("must be archlinux:base-devel@sha256", proc.stderr)
+
     def test_image_is_digest_pinned_and_shared(self) -> None:
         self.assertRegex(up.MOON_SANDBOX_IMAGE, r"^archlinux:base-devel@sha256:[0-9a-f]{64}$")
         scripts = Path(up.__file__).resolve().parent
