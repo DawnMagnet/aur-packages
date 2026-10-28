@@ -105,10 +105,22 @@ jobs:
         if: steps.upd.outputs.changed == 'true'
         run: git diff -- "${{ matrix.package }}"
 
+      # Read-only AUR RPC lookup. A repo version newer than the AUR (or a
+      # package missing on the AUR) is treated as changed; an AUR version
+      # newer than the repo fails the job. If the RPC cannot be read, the
+      # comparison is skipped and changed stays as update_package.py set it,
+      # so the RPC alone never triggers a publish.
+      - name: Compare with the AUR
+        id: aur
+        env:
+          PACKAGE: ${{ matrix.package }}
+          CHANGED: ${{ steps.upd.outputs.changed }}
+        run: python3 scripts/aur_rpc.py --package "$PACKAGE" --changed "$CHANGED"
+
       - name: Decide whether to build
         id: gate
         env:
-          CHANGED: ${{ steps.upd.outputs.changed }}
+          CHANGED: ${{ steps.aur.outputs.changed }}
           EVENT_NAME: ${{ github.event_name }}
           # Schedule and push have no force_publish input. The comparison
           # below is false for those events, so the value cannot leak through.
