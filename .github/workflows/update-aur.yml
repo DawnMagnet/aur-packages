@@ -4,7 +4,7 @@ name: Update AUR packages
 # container that cannot see the sealed PKGBUILD. The build job has
 # contents: read, no AUR key, and persist-credentials: false. Only the sealed
 # PKGBUILD leaves via an artifact. publish checks out main again, recomputes
-# the expected pkgver of -git packages from upstream itself, regenerates
+# the expected pkgver of every package from upstream itself, regenerates
 # .SRCINFO with makepkg --printsrcinfo, and is the only job in the aur
 # environment, the only job with AUR_SSH_PRIVATE_KEY, and the only job with
 # contents: write.
@@ -224,13 +224,33 @@ jobs:
             --package "$PACKAGE" \
             --artifact "${RUNNER_TEMP}/aur-artifact"
 
+      # Release packages: run the updater's version logic read-only on this
+      # host against main's PKGBUILD (no writes into the checkout, no
+      # nvchecker, moonbit's `moon version` runs in a no-network container).
+      # import requires the artifact pkgver, pkgrel and source arrays to match
+      # exactly (-git packages: source arrays must equal main's).
+      - name: Compute expected release version on the host
+        id: expect_release
+        if: steps.download.outcome == 'success' && !endsWith(matrix.package, '-git')
+        env:
+          PACKAGE: ${{ matrix.package }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/publish_artifact.py expect-release \
+            --package "$PACKAGE" \
+            --artifact "${RUNNER_TEMP}/aur-artifact" \
+            --main-pkgbuild "${GITHUB_WORKSPACE}/${PACKAGE}/PKGBUILD"
+
       - name: Import artifact
         id: import
         if: steps.download.outcome == 'success'
         env:
           PACKAGE: ${{ matrix.package }}
-          EXPECTED_PKGVER: ${{ steps.expect.outputs.pkgver }}
+          EXPECTED_PKGVER: ${{ steps.expect.outputs.pkgver || steps.expect_release.outputs.pkgver }}
           EXPECTED_COMMIT: ${{ steps.expect.outputs.commit }}
+          EXPECTED_PKGREL: ${{ steps.expect_release.outputs.pkgrel }}
+          EXPECTED_SOURCES: ${{ steps.expect_release.outputs.sources }}
         run: |
           set -euo pipefail
           python3 scripts/publish_artifact.py import \
@@ -238,7 +258,9 @@ jobs:
             --artifact "${RUNNER_TEMP}/aur-artifact" \
             --dest "${GITHUB_WORKSPACE}/${PACKAGE}" \
             --expected-pkgver "$EXPECTED_PKGVER" \
-            --expected-commit "$EXPECTED_COMMIT"
+            --expected-commit "$EXPECTED_COMMIT" \
+            --expected-pkgrel "$EXPECTED_PKGREL" \
+            --expected-sources "$EXPECTED_SOURCES"
 
       - name: Regenerate .SRCINFO
         if: steps.import.outputs.publish == 'true'

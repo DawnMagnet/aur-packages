@@ -149,7 +149,13 @@ def stable_github_version(repo: str, prefix: str) -> str:
     return best
 
 
-def choose_release_version(name: str) -> str:
+def choose_release_version(name: str, *, use_nvchecker: bool = True) -> str:
+    """Highest stable GitHub release, or nvchecker's value when it is newer.
+
+    use_nvchecker=False is the read-only mode for the publish host: nvchecker
+    writes nvchecker-keyfile.toml (with the token) and new_ver.json into the
+    checkout, so it is skipped and only the GitHub releases API is read.
+    """
     entry = load_nv_entry(name)
     if entry.get("source") != "github":
         raise SystemExit(f"{name} is not a github nvchecker entry")
@@ -157,6 +163,8 @@ def choose_release_version(name: str) -> str:
     prefix = entry.get("prefix") or ""
     api_version = stable_github_version(repo, prefix)
     log(f"github releases {repo} -> {api_version}")
+    if not use_nvchecker:
+        return api_version
     nv = nvchecker_version(name)
     chosen = api_version
     if nv and not PRE_RE.search(nv) and vercmp(nv, api_version) > 0:
@@ -310,13 +318,54 @@ def update_memprocfs() -> None:
     mark_changed("memprocfs", old_full, new_full)
 
 
-def probe_moonbit() -> dict:
+MOON_SANDBOX_IMAGE = "archlinux:base-devel"
+
+
+def moon_version_sandboxed(bindir: Path) -> str:
+    """Run `moon version` in a throwaway container.
+
+    The publish job holds a write token in .git/config, so the upstream
+    binary must not run on that host directly. The container gets only the
+    extracted bin directory (read-only), no network, no capabilities, a
+    read-only root and an unprivileged user.
+    """
+    for path in [bindir, *bindir.rglob("*")]:
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode
+        path.chmod(mode | (0o755 if path.is_dir() else 0o444))
+    return subprocess.check_output(
+        [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--read-only",
+            "--tmpfs", "/tmp",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", "65534:65534",
+            "-v", f"{bindir}:/opt/moon/bin:ro",
+            "-e", "HOME=/tmp",
+            "-e", "PATH=/opt/moon/bin:/usr/bin:/bin",
+            "-e", "MOONC_OVERRIDE=/opt/moon/bin/moonc",
+            "-e", "MOONRUN_OVERRIDE=/opt/moon/bin/moonrun",
+            MOON_SANDBOX_IMAGE,
+            "/opt/moon/bin/moon", "version",
+        ],
+        text=True,
+    )
+
+
+def probe_moonbit(*, with_core: bool = True, sandbox: bool = False) -> dict:
     """Download the latest toolchain and read `moon version`.
 
     MoonBit's installer accepts a version segment, but dated paths such as
     binaries/0.1.20261023/ return S3 AccessDenied. The only published channels
     are `latest` and `nightly`, so the PKGBUILD keeps the latest URL and pins
     the checksum of the tarball that produced pkgver.
+
+    The publish host calls this with with_core=False (core-latest.tar.gz is
+    not needed for the version) and sandbox=True (see moon_version_sandboxed).
+    Everything is written under a temporary directory outside the checkout.
     """
     tmp = Path(tempfile.mkdtemp(prefix="moonbit-"))
     try:
@@ -333,29 +382,33 @@ def probe_moonbit() -> dict:
                 "https://cli.moonbitlang.com/binaries/latest/moonbit-linux-x86_64.tar.gz",
             ]
         )
-        subprocess.check_call(
-            [
-                "curl",
-                "-fL",
-                "--retry",
-                "3",
-                "-o",
-                str(core),
-                "https://cli.moonbitlang.com/cores/core-latest.tar.gz",
-            ]
-        )
+        if with_core:
+            subprocess.check_call(
+                [
+                    "curl",
+                    "-fL",
+                    "--retry",
+                    "3",
+                    "-o",
+                    str(core),
+                    "https://cli.moonbitlang.com/cores/core-latest.tar.gz",
+                ]
+            )
         subprocess.check_call(
             ["tar", "-xzf", str(archive), "-C", str(tmp), "./bin"]
         )
         for path in (tmp / "bin").rglob("*"):
             if path.is_file():
                 path.chmod(path.stat().st_mode | 0o755)
-        moon = tmp / "bin" / "moon"
-        env = os.environ.copy()
-        env["PATH"] = str(tmp / "bin") + os.pathsep + env.get("PATH", "")
-        env["MOONC_OVERRIDE"] = str(tmp / "bin" / "moonc")
-        env["MOONRUN_OVERRIDE"] = str(tmp / "bin" / "moonrun")
-        output = subprocess.check_output([str(moon), "version"], env=env, text=True)
+        if sandbox:
+            output = moon_version_sandboxed(tmp / "bin")
+        else:
+            moon = tmp / "bin" / "moon"
+            env = os.environ.copy()
+            env["PATH"] = str(tmp / "bin") + os.pathsep + env.get("PATH", "")
+            env["MOONC_OVERRIDE"] = str(tmp / "bin" / "moonc")
+            env["MOONRUN_OVERRIDE"] = str(tmp / "bin" / "moonrun")
+            output = subprocess.check_output([str(moon), "version"], env=env, text=True)
         match = re.search(r"^moon\s+(\d+\.\d+\.\d+)", output, re.M)
         if not match:
             raise SystemExit(f"could not parse moon version from: {output!r}")
@@ -381,6 +434,58 @@ def update_moonbit() -> None:
     text = bump_pkgver(text, new_ver)
     write_pkgbuild("moonbit-bin", text)
     mark_changed("moonbit-bin", old_full, new_full)
+
+
+RELEASE_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin")
+PKGREL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def expected_release(pkg: str, main_pkgbuild: str) -> tuple[str, str]:
+    pkgver, pkgrel, _text = expected_release_pkgbuild(pkg, main_pkgbuild)
+    return pkgver, pkgrel
+
+
+def expected_release_pkgbuild(pkg: str, main_pkgbuild: str) -> tuple[str, str, str]:
+    """Read-only twin of update_maple / update_memprocfs / update_moonbit.
+
+    Returns the (pkgver, pkgrel) the updater would leave in the PKGBUILD,
+    given the PKGBUILD on main, without writing anything into the checkout
+    and without nvchecker. pkgrel follows the updater: memprocfs uses the
+    upstream asset date; the others keep main's pkgrel when pkgver is
+    unchanged and reset it to 1 on a pkgver bump. An upstream version older
+    than main fails, like the updater's downgrade check.
+
+    The third value is the PKGBUILD text the updater would write, built in
+    memory only (memprocfs gets its source URLs rewritten, as in
+    update_memprocfs). publish_artifact.py takes the expected source arrays
+    from it.
+    """
+    main_ver = read_var(main_pkgbuild, "pkgver")
+    main_rel = read_var(main_pkgbuild, "pkgrel")
+    text = main_pkgbuild
+    if pkg == "memprocfs":
+        info = probe_memprocfs()
+        pkgver, pkgrel = info["pkgver"], info["pkgrel"]
+        text = set_quoted_array(text, "source_x86_64", info["x86_64"])
+        text = set_quoted_array(text, "source_aarch64", info["aarch64"])
+    elif pkg == "maple-mono-nf-cn":
+        pkgver = choose_release_version(pkg, use_nvchecker=False)
+        pkgrel = main_rel if pkgver == main_ver else "1"
+    elif pkg == "moonbit-bin":
+        info = probe_moonbit(with_core=False, sandbox=True)
+        log(info["moon_output"])
+        pkgver = info["pkgver"]
+        pkgrel = main_rel if pkgver == main_ver else "1"
+    else:
+        raise SystemExit(f"{pkg} is not a release package")
+    if not PKGVER_RE.fullmatch(pkgver) or not PKGREL_RE.fullmatch(pkgrel):
+        raise SystemExit(f"{pkg}: refusing host-computed version {pkgver!r}-{pkgrel!r}")
+    if vercmp(full_version(pkgver, pkgrel), full_version(main_ver, main_rel)) < 0:
+        raise SystemExit(
+            f"{pkg}: upstream {pkgver}-{pkgrel} is older than main {main_ver}-{main_rel}"
+        )
+    text = set_var(set_var(text, "pkgver", pkgver), "pkgrel", pkgrel)
+    return pkgver, pkgrel, text
 
 
 PKGVER_RE = re.compile(r"[A-Za-z0-9._+]+")
