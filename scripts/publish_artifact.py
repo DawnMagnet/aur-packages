@@ -16,7 +16,8 @@ import sys
 from pathlib import Path
 
 from alpmver import vercmp
-from update_package import read_var, same_pkgver_commit, set_output
+import update_package
+from update_package import GIT_HASH_RE, read_var, same_pkgver_commit, set_output
 
 MAX_BYTES = 256 * 1024
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
@@ -185,7 +186,8 @@ def assert_pkgbuild_delta(
     the host-generated PKGBUILD of this run and makepkg's pkgver() may only change
     the hash length. import compares against main, which is the previous release,
     so a -git package moving to a newer upstream commit is expected there; import
-    relies on assert_not_downgrade instead.
+    relies on assert_host_pkgver (exact match with the host-computed pkgver) and
+    assert_not_downgrade instead.
     """
     if read_var(baseline, "pkgname") != package or read_var(updated, "pkgname") != package:
         die(f"PKGBUILD pkgname is not {package}")
@@ -321,13 +323,46 @@ def write_into(dest: Path, name: str, data: bytes) -> None:
     os.replace(tmp, target)
 
 
-def import_artifact(package: str, artifact: Path, dest: Path) -> None:
+def assert_host_pkgver(
+    package: str,
+    updated: str,
+    expected_pkgver: str | None,
+    expected_commit: str | None,
+) -> None:
+    """Require the sealed pkgver to equal the pkgver the publish host computed.
+
+    import masks pkgver when it compares PKGBUILDs, and vercmp alone cannot
+    tell two hashes of the same rN apart or stop a huge rN that would block
+    every later update. For -git packages the publish job recomputes the
+    pkgver from upstream (publish_artifact.py expect) and passes it in here;
+    a missing value fails closed. Other packages are unchanged unless a value
+    is passed.
+    """
+    is_git = package.endswith("-git")
+    if not expected_pkgver:
+        if is_git:
+            die(f"{package}: missing host-computed --expected-pkgver; refusing to import")
+        return
+    if not update_package.PKGVER_RE.fullmatch(expected_pkgver):
+        die(f"{package}: refusing expected pkgver {expected_pkgver!r}")
+    actual = read_var(updated, "pkgver")
+    if actual != expected_pkgver:
+        die(
+            f"{package}: artifact pkgver {actual} does not match the host-computed "
+            f"pkgver {expected_pkgver}"
+        )
+    if not is_git:
+        return
+    if not expected_commit or not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
+        die(f"{package}: missing or invalid host-computed --expected-commit; refusing to import")
+    match = GIT_HASH_RE.search(actual)
+    if match is None or not expected_commit.startswith(match.group(1)):
+        die(f"{package}: artifact pkgver {actual} is not commit {expected_commit}")
+
+
+def read_artifact(package: str, artifact: Path) -> bytes | None:
+    """Validate the artifact layout. Return the PKGBUILD bytes, or None for skip."""
     validate_package(package)
-    if dest.is_symlink() or not dest.is_dir():
-        die("dest must be the package directory")
-    dest = dest.resolve()
-    if dest.name != package:
-        die("dest directory name must match the package")
     root = locate_artifact(artifact)
     names = list_files(root)
     manifest = parse_manifest(read_text_file(root / "MANIFEST"))
@@ -335,8 +370,7 @@ def import_artifact(package: str, artifact: Path, dest: Path) -> None:
     if status == "skip":
         if names != ["MANIFEST"]:
             die("skip artifact must contain only MANIFEST")
-        set_output("publish", "false")
-        return
+        return None
     if status != "publish":
         die("MANIFEST status must be publish or skip")
     # .SRCINFO from the build is never accepted. The publish job regenerates it.
@@ -344,12 +378,61 @@ def import_artifact(package: str, artifact: Path, dest: Path) -> None:
         die(f"unexpected artifact files: {names}")
     pkg_bytes = read_bytes(root / "PKGBUILD")
     check_hash("PKGBUILD", pkg_bytes, manifest.get("pkgbuild"))
+    return pkg_bytes
+
+
+def expect(package: str, artifact: Path) -> None:
+    """Compute the expected pkgver for a -git artifact on the publish host.
+
+    The artifact pkgver only names a commit. That commit must exist on the
+    upstream default branch, and the expected pkgver is git describe of it,
+    computed here. Writes the outputs pkgver and commit (empty for skip).
+    """
+    validate_package(package)
+    url = update_package.GIT_REPOS.get(package)
+    if url is None:
+        die(f"{package} is not a -git package with a known upstream")
+    pkg_bytes = read_artifact(package, artifact)
+    if pkg_bytes is None:
+        set_output("pkgver", "")
+        set_output("commit", "")
+        return
+    for line in pkg_bytes.decode("utf-8").splitlines():
+        if line.startswith("pkgver=") and ASSIGN_RE.fullmatch(line) is None:
+            die(f"unsafe pkgver/pkgrel line: {line!r}")
+    candidate = read_var(pkg_bytes.decode("utf-8"), "pkgver")
+    match = GIT_HASH_RE.search(candidate)
+    if match is None:
+        die(f"{package}: artifact pkgver {candidate!r} does not end in a git hash")
+    pkgver, commit = update_package.git_commit_pkgver(url, match.group(1))
+    set_output("pkgver", pkgver)
+    set_output("commit", commit)
+
+
+def import_artifact(
+    package: str,
+    artifact: Path,
+    dest: Path,
+    expected_pkgver: str | None = None,
+    expected_commit: str | None = None,
+) -> None:
+    validate_package(package)
+    if dest.is_symlink() or not dest.is_dir():
+        die("dest must be the package directory")
+    dest = dest.resolve()
+    if dest.name != package:
+        die("dest directory name must match the package")
+    pkg_bytes = read_artifact(package, artifact)
+    if pkg_bytes is None:
+        set_output("publish", "false")
+        return
     pkgbuild = pkg_bytes.decode("utf-8")
     current_path = dest / "PKGBUILD"
     if current_path.is_symlink() or not current_path.is_file():
         die("checkout PKGBUILD must be a regular file")
     current = read_text_file(current_path)
     assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True, require_same_git_commit=False)
+    assert_host_pkgver(package, pkgbuild, expected_pkgver, expected_commit)
     assert_not_downgrade(package, current, pkgbuild)
     write_into(dest, "PKGBUILD", pkg_bytes)
     set_output("publish", "true")
@@ -378,6 +461,12 @@ def main(argv: list[str]) -> int:
     import_cmd.add_argument("--package", required=True)
     import_cmd.add_argument("--artifact", required=True, type=Path)
     import_cmd.add_argument("--dest", required=True, type=Path)
+    import_cmd.add_argument("--expected-pkgver", default="")
+    import_cmd.add_argument("--expected-commit", default="")
+
+    expect_cmd = sub.add_parser("expect")
+    expect_cmd.add_argument("--package", required=True)
+    expect_cmd.add_argument("--artifact", required=True, type=Path)
 
     args = parser.parse_args(argv[1:])
     if args.cmd == "check-pkgbuild":
@@ -389,8 +478,16 @@ def main(argv: list[str]) -> int:
         stage(args.package, args.baseline, args.build_out, args.stage)
     elif args.cmd == "stage-skip":
         stage_skip(args.stage)
+    elif args.cmd == "expect":
+        expect(args.package, args.artifact)
     else:
-        import_artifact(args.package, args.artifact, args.dest)
+        import_artifact(
+            args.package,
+            args.artifact,
+            args.dest,
+            args.expected_pkgver or None,
+            args.expected_commit or None,
+        )
     return 0
 
 

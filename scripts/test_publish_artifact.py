@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import publish_artifact as gate
+import update_package as up
 
 H1 = "ab" * 32
 H2 = "cd" * 32
@@ -244,7 +248,13 @@ class ImportTest(unittest.TestCase):
             dest = root / "cuda-api-wrappers-git"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(current, encoding="utf-8")
-            gate.import_artifact("cuda-api-wrappers-git", artifact, dest)
+            gate.import_artifact(
+                "cuda-api-wrappers-git",
+                artifact,
+                dest,
+                "0.8.2.r0.gc2f2a2b",
+                "c2f2a2b1" + "0" * 32,
+            )
             self.assertIn("pkgver=0.8.2.r0.gc2f2a2b\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
 
     REFLECTCPP_R10 = (
@@ -255,7 +265,28 @@ class ImportTest(unittest.TestCase):
     )
     REFLECTCPP_R12 = REFLECTCPP_R10.replace("r10.g587b72ee", "r12.g5457ea3c")
 
-    def import_git(self, current: str, updated: str) -> Path:
+    # Full commits as the publish host would resolve them upstream.
+    COMMITS = {
+        "587b72ee": "587b72ee" + "1" * 32,
+        "5457ea3c": "5457ea3c" + "2" * 32,
+    }
+
+    def import_git(
+        self,
+        current: str,
+        updated: str,
+        expected: str | None = "from-updated",
+        commit: str | None = "from-expected",
+    ) -> Path:
+        """Import updated over current. By default the host-computed pkgver
+        equals the artifact pkgver, as for an honest build."""
+        if expected == "from-updated":
+            expected = gate.read_var(updated, "pkgver")
+        if commit == "from-expected":
+            commit = None
+            if expected:
+                abbrev = expected.rsplit(".g", 1)[1]
+                commit = self.COMMITS.get(abbrev, abbrev.ljust(40, "0"))
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -265,7 +296,8 @@ class ImportTest(unittest.TestCase):
         dest = root / "reflectcpp-git"
         dest.mkdir()
         (dest / "PKGBUILD").write_text(current, encoding="utf-8")
-        gate.import_artifact("reflectcpp-git", artifact, dest)
+        self.dest = dest
+        gate.import_artifact("reflectcpp-git", artifact, dest, expected, commit)
         return dest
 
     def test_import_allows_a_newer_git_commit(self) -> None:
@@ -288,6 +320,200 @@ class ImportTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 StageTest().stage(Path(tmp), self.REFLECTCPP_R12, self.REFLECTCPP_R10, "reflectcpp-git")
             self.assertIn("not the same commit", str(caught.exception))
+
+    # Host-computed pkgver (follow-up to PR #1).
+
+    def assert_rejected(self, current: str, updated: str, expected: str | None, needle: str) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.import_git(current, updated, expected)
+        self.assertIn(needle, str(caught.exception))
+        self.assertEqual((self.dest / "PKGBUILD").read_text(encoding="utf-8"), current)
+
+    def test_host_pkgver_match_is_accepted(self) -> None:
+        dest = self.import_git(self.REFLECTCPP_R12, self.REFLECTCPP_R12, "0.26.2.r12.g5457ea3c")
+        self.assertIn("pkgver=0.26.2.r12.g5457ea3c\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_normal_upgrade_r10_to_r12_is_accepted_when_host_expects_r12(self) -> None:
+        dest = self.import_git(self.REFLECTCPP_R10, self.REFLECTCPP_R12, "0.26.2.r12.g5457ea3c")
+        self.assertIn("pkgver=0.26.2.r12.g5457ea3c\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_same_rn_other_hash_is_rejected_in_both_orders(self) -> None:
+        # deadbeef sorts after 5457ea3c and 0123abcd sorts before it. Under
+        # vercmp alone one of these would pass; both must fail now.
+        for other in ("deadbeef", "0123abcd"):
+            for current in (self.REFLECTCPP_R10, self.REFLECTCPP_R12):
+                with self.subTest(other=other, current=current.splitlines()[1]):
+                    updated = self.REFLECTCPP_R12.replace("g5457ea3c", f"g{other}")
+                    self.assert_rejected(current, updated, "0.26.2.r12.g5457ea3c", "does not match")
+
+    def test_host_expected_other_hash_rejects_either_artifact(self) -> None:
+        # Swap roles: the host resolved deadbeef / 0123abcd, the artifact says 5457ea3c.
+        for other in ("deadbeef", "0123abcd"):
+            with self.subTest(other=other):
+                self.assert_rejected(
+                    self.REFLECTCPP_R10, self.REFLECTCPP_R12, f"0.26.2.r12.g{other}", "does not match"
+                )
+
+    def test_huge_rn_is_rejected(self) -> None:
+        updated = self.REFLECTCPP_R12.replace("r12.g5457ea3c", "r99999.g5457ea3c")
+        self.assert_rejected(self.REFLECTCPP_R10, updated, "0.26.2.r12.g5457ea3c", "does not match")
+
+    def test_missing_expected_pkgver_fails_closed(self) -> None:
+        for missing in (None, ""):
+            with self.subTest(missing=missing):
+                self.assert_rejected(self.REFLECTCPP_R10, self.REFLECTCPP_R12, missing, "missing host-computed")
+
+    def test_missing_or_wrong_expected_commit_fails_closed(self) -> None:
+        for commit, needle in ((None, "expected-commit"), ("", "expected-commit"), ("deadbeef" * 5, "is not commit")):
+            with self.subTest(commit=commit):
+                with self.assertRaises(SystemExit) as caught:
+                    self.import_git(self.REFLECTCPP_R10, self.REFLECTCPP_R12, "0.26.2.r12.g5457ea3c", commit)
+                self.assertIn(needle, str(caught.exception))
+
+    def test_cli_import_without_expected_pkgver_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            write_pkgbuild(artifact, self.REFLECTCPP_R12)
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+            dest = root / "reflectcpp-git"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(self.REFLECTCPP_R10, encoding="utf-8")
+            argv = ["publish_artifact.py", "import", "--package", "reflectcpp-git",
+                    "--artifact", str(artifact), "--dest", str(dest)]
+            for extra in ([], ["--expected-pkgver", "", "--expected-commit", ""]):
+                with self.subTest(extra=extra):
+                    with self.assertRaises(SystemExit) as caught:
+                        gate.main(argv + extra)
+                    self.assertIn("missing host-computed", str(caught.exception))
+            self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), self.REFLECTCPP_R10)
+
+    def test_git_skip_artifact_needs_no_expected_pkgver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            gate.stage_skip(stage)
+            dest = root / "reflectcpp-git"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(self.REFLECTCPP_R10, encoding="utf-8")
+            gate.import_artifact("reflectcpp-git", stage, dest)
+            self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), self.REFLECTCPP_R10)
+
+    def test_non_git_import_is_unchanged_without_expected_pkgver(self) -> None:
+        # moonbit-bin schedule / force: no expect step, no expected value.
+        old = "pkgname=moonbit-bin\npkgver=0.1.20261023\npkgrel=2\n" f"sha256sums=('{H1}')\n"
+        for new in (old.replace("20261023", "20261101").replace("pkgrel=2", "pkgrel=1").replace(H1, H3), old):
+            with self.subTest(new=new.splitlines()[1]), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                artifact = root / "artifact"
+                write_pkgbuild(artifact, new)
+                gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+                dest = root / "moonbit-bin"
+                dest.mkdir()
+                (dest / "PKGBUILD").write_text(old, encoding="utf-8")
+                gate.import_artifact("moonbit-bin", artifact, dest)
+                self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), new)
+
+
+class ExpectTest(unittest.TestCase):
+    R12 = ImportTest.REFLECTCPP_R12
+
+    def artifact(self, root: Path, pkgbuild: str) -> Path:
+        artifact = root / "artifact"
+        write_pkgbuild(artifact, pkgbuild)
+        gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+        return artifact
+
+    def run_expect(self, artifact: Path, package: str = "reflectcpp-git") -> dict[str, str]:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}):
+                gate.expect(package, artifact)
+            return dict(line.split("=", 1) for line in out.read_text(encoding="utf-8").splitlines())
+
+    def test_expect_resolves_the_commit_named_by_the_artifact(self) -> None:
+        calls = []
+
+        def fake(url: str, abbrev: str) -> tuple[str, str]:
+            calls.append((url, abbrev))
+            return "0.26.2.r12.g5457ea3c", "5457ea3c" + "2" * 32
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(up, "git_commit_pkgver", fake):
+            # The artifact claims r99999; the host still reports what upstream says.
+            claimed = self.R12.replace("r12.", "r99999.")
+            outputs = self.run_expect(self.artifact(Path(tmp), claimed))
+        self.assertEqual(calls, [("https://github.com/getml/reflect-cpp.git", "5457ea3c")])
+        self.assertEqual(outputs, {"pkgver": "0.26.2.r12.g5457ea3c", "commit": "5457ea3c" + "2" * 32})
+
+    def test_expect_skip_artifact_outputs_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "stage"
+            gate.stage_skip(stage)
+            self.assertEqual(self.run_expect(stage), {"pkgver": "", "commit": ""})
+
+    def test_expect_refuses_non_git_and_hashless_pkgver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = self.artifact(Path(tmp), BASELINE)
+            with self.assertRaises(SystemExit):
+                self.run_expect(artifact, "maple-mono-nf-cn")
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = self.artifact(Path(tmp), self.R12.replace("r12.g5457ea3c", "r12"))
+            with self.assertRaises(SystemExit) as caught:
+                self.run_expect(artifact)
+            self.assertIn("git hash", str(caught.exception))
+
+
+class GitCommitPkgverTest(unittest.TestCase):
+    """git_commit_pkgver against a local upstream repository (offline)."""
+
+    def git(self, *args: str) -> str:
+        return subprocess.check_output(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *args],
+            cwd=self.repo, text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name) / "upstream"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("commit", "-q", "--allow-empty", "-m", "base")
+        self.git("tag", "v0.26.2")
+        self.commits = []
+        for index in range(12):
+            self.git("commit", "-q", "--allow-empty", "-m", f"c{index}")
+            self.commits.append(self.git("rev-parse", "HEAD"))
+        self.git("checkout", "-q", "-b", "side", self.commits[9])
+        self.git("commit", "-q", "--allow-empty", "-m", "side")
+        self.side = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+
+    def test_pkgver_of_a_pinned_commit(self) -> None:
+        r12 = self.commits[11]
+        pkgver, full = up.git_commit_pkgver(str(self.repo), r12[:8])
+        self.assertEqual(pkgver, f"0.26.2.r12.g{r12[:8]}")
+        self.assertEqual(full, r12)
+        r10 = self.commits[9]
+        pkgver, _ = up.git_commit_pkgver(str(self.repo), r10[:7])
+        self.assertEqual(pkgver, f"0.26.2.r10.g{r10[:7]}")
+
+    def test_unknown_commit_is_refused(self) -> None:
+        missing = "deadbeef" if not any(c.startswith("deadbeef") for c in self.commits) else "0badf00d"
+        with self.assertRaises(SystemExit) as caught:
+            up.git_commit_pkgver(str(self.repo), missing)
+        self.assertIn("does not exist upstream", str(caught.exception))
+
+    def test_commit_off_the_default_branch_is_refused(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            up.git_commit_pkgver(str(self.repo), self.side[:8])
+        self.assertIn("not on the upstream default branch", str(caught.exception))
+
+    def test_bad_abbreviation_is_refused(self) -> None:
+        for bad in ("abc", "XYZ12345", "1234567;rm"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                up.git_commit_pkgver(str(self.repo), bad)
 
     def test_skip_marker_does_not_touch_the_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

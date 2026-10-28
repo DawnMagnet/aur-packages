@@ -383,6 +383,21 @@ def update_moonbit() -> None:
     mark_changed("moonbit-bin", old_full, new_full)
 
 
+PKGVER_RE = re.compile(r"[A-Za-z0-9._+]+")
+
+
+def describe_to_pkgver(described: str) -> str:
+    """Same transform as the PKGBUILD pkgver() functions."""
+    pkgver = subprocess.check_output(
+        ["sed", r"s/^v//;s/\([^-]*-g\)/r\1/;s/-/./g"],
+        input=described + "\n",
+        text=True,
+    ).strip()
+    if not pkgver or not PKGVER_RE.fullmatch(pkgver):
+        raise SystemExit(f"refusing pkgver {pkgver!r} from git describe {described!r}")
+    return pkgver
+
+
 def git_pkgver(url: str, describe_args: list[str]) -> tuple[str, str]:
     """Return (pkgver, full commit hash) for the default branch of url."""
     tmp = Path(tempfile.mkdtemp(prefix="pkgver-"))
@@ -401,15 +416,50 @@ def git_pkgver(url: str, describe_args: list[str]) -> tuple[str, str]:
         ).strip()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    # Same transform as the PKGBUILD pkgver() functions.
-    pkgver = subprocess.check_output(
-        ["sed", r"s/^v//;s/\([^-]*-g\)/r\1/;s/-/./g"],
-        input=described + "\n",
-        text=True,
-    ).strip()
-    if not pkgver or not re.fullmatch(r"[A-Za-z0-9._+]+", pkgver):
-        raise SystemExit(f"refusing pkgver {pkgver!r} from git describe {described!r}")
-    return pkgver, head
+    return describe_to_pkgver(described), head
+
+
+def git_commit_pkgver(url: str, abbrev: str) -> tuple[str, str]:
+    """Return (pkgver, full commit hash) for one commit of url's default branch.
+
+    The publish job uses this to recompute a -git pkgver on the host. abbrev
+    only selects the commit. The commit must exist upstream and be reachable
+    from the default branch, and the pkgver comes from git describe of that
+    commit with the same transform as update_git, abbreviated to the same
+    length so the string can be compared exactly.
+    """
+    if not re.fullmatch(r"[0-9a-f]{4,40}", abbrev):
+        raise SystemExit(f"refusing commit abbreviation {abbrev!r}")
+    tmp = Path(tempfile.mkdtemp(prefix="pkgver-"))
+    try:
+        src = tmp / "src"
+        subprocess.check_call(
+            ["git", "clone", "--filter=blob:none", "--no-checkout", url, str(src)],
+            stdout=subprocess.DEVNULL,
+        )
+        proc = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{abbrev}^{{commit}}"],
+            cwd=src,
+            text=True,
+            capture_output=True,
+        )
+        full = proc.stdout.strip()
+        if proc.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", full):
+            raise SystemExit(f"commit {abbrev} does not exist upstream or is ambiguous")
+        reachable = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", full, "HEAD"],
+            cwd=src,
+        )
+        if reachable.returncode != 0:
+            raise SystemExit(f"commit {full} is not on the upstream default branch")
+        described = subprocess.check_output(
+            ["git", "describe", "--long", "--tags", f"--abbrev={len(abbrev)}", full],
+            cwd=src,
+            text=True,
+        ).strip()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return describe_to_pkgver(described), full
 
 
 GIT_HASH_RE = re.compile(r"\.g([0-9a-f]{4,40})$")
@@ -458,18 +508,19 @@ def update_git(pkg: str, url: str) -> None:
     mark_changed(pkg, old_full, new_full)
 
 
+GIT_REPOS = {
+    "cuda-api-wrappers-git": "https://github.com/eyalroz/cuda-api-wrappers.git",
+    "reflectcpp-git": "https://github.com/getml/reflect-cpp.git",
+}
+
 UPDATERS = {
     "maple-mono-nf-cn": update_maple,
     "memprocfs": update_memprocfs,
     "moonbit-bin": update_moonbit,
     "cuda-api-wrappers-git": lambda: update_git(
-        "cuda-api-wrappers-git",
-        "https://github.com/eyalroz/cuda-api-wrappers.git",
+        "cuda-api-wrappers-git", GIT_REPOS["cuda-api-wrappers-git"]
     ),
-    "reflectcpp-git": lambda: update_git(
-        "reflectcpp-git",
-        "https://github.com/getml/reflect-cpp.git",
-    ),
+    "reflectcpp-git": lambda: update_git("reflectcpp-git", GIT_REPOS["reflectcpp-git"]),
 }
 
 
