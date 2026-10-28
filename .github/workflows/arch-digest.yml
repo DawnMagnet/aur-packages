@@ -3,8 +3,10 @@
 # Dependabot cannot track scripts/archlinux-image. This job reads the current
 # archlinux:base-devel index digest from Docker Hub's official
 # library/archlinux repository and, if it differs from the pinned one, opens
-# (or updates) a single reminder issue. It never changes the repository: the
-# digest bump is a normal PR that goes through review.
+# (or updates) a single reminder issue; once the pin is current again it closes
+# it. Only issues opened by github-actions with the arch-digest-reminder label
+# are touched (scripts/arch_digest_reminders.sh). It never changes the
+# repository: the digest bump is a normal PR that goes through review.
 name: Arch image digest
 
 on:
@@ -26,6 +28,9 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      TITLE: Arch build image digest is outdated
+      LABEL: arch-digest-reminder
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,7 +52,6 @@ jobs:
           set -euo pipefail
           re='^archlinux:base-devel@sha256:[0-9a-f]{64}$'
           [[ "$PINNED" =~ $re && "$LATEST" =~ $re ]] || { echo "malformed digest output" >&2; exit 1; }
-          title="Arch build image digest is outdated"
           body="$(printf '%s\n' \
             "Docker Hub's official \`library/archlinux:base-devel\` has a new index digest." \
             "" \
@@ -55,12 +59,33 @@ jobs:
             "- latest: \`${LATEST}\`" \
             "" \
             "Open a PR that sets \`scripts/archlinux-image\` to the latest value; it goes through the usual review." \
+            "Verify the digest yourself in that PR (run \`scripts/check_arch_digest.sh\` or query Docker Hub); do not copy the value from this issue." \
             "Checked by run ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}.")"
-          existing="$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number,title |
-            jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')"
+          # Idempotent: creates the label, or resets its color/description.
+          gh label create "$LABEL" -R "$REPO" --force --color ededed \
+            --description "Opened by the Arch image digest workflow"
+          existing="$(bash scripts/arch_digest_reminders.sh)"
+          existing="${existing%%$'\n'*}" # oldest one
           if [[ -n "$existing" ]]; then
             gh issue edit "$existing" -R "$REPO" --body "$body"
             echo "updated issue #$existing"
           else
-            gh issue create -R "$REPO" --title "$title" --body "$body"
+            gh issue create -R "$REPO" --title "$TITLE" --label "$LABEL" --body "$body"
           fi
+
+      - name: Close the reminder issue
+        if: steps.digest.outputs.status == 'current'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PINNED: ${{ steps.digest.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          re='^archlinux:base-devel@sha256:[0-9a-f]{64}$'
+          [[ "$PINNED" =~ $re ]] || { echo "malformed digest output" >&2; exit 1; }
+          open_issues="$(bash scripts/arch_digest_reminders.sh)"
+          for n in $open_issues; do
+            gh issue close "$n" -R "$REPO" \
+              --comment "\`scripts/archlinux-image\` (\`${PINNED}\`) matches Docker Hub again; closing."
+            echo "closed issue #$n"
+          done

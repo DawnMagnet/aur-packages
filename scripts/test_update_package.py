@@ -28,6 +28,45 @@ class ArchImageTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("must be archlinux:base-devel@sha256", proc.stderr)
 
+    def test_reminder_lookup_trusts_only_labelled_bot_issues(self) -> None:
+        import json, tempfile
+        scripts = Path(up.__file__).resolve().parent
+        title, label = "Arch build image digest is outdated", "arch-digest-reminder"
+        bot = {"login": "app/github-actions", "is_bot": True}
+        lab = [{"name": label}]
+        issues = [
+            {"number": 9, "title": title, "author": bot, "labels": lab},
+            {"number": 3, "title": title, "author": bot, "labels": lab},
+            {"number": 4, "title": title, "author": {"login": "mallory", "is_bot": False}, "labels": lab},
+            {"number": 5, "title": title, "author": {"login": "app/evil-bot", "is_bot": True}, "labels": lab},
+            {"number": 6, "title": title, "author": {"login": "app/github-actions", "is_bot": False}, "labels": lab},
+            {"number": 7, "title": title + " ", "author": bot, "labels": lab},
+            {"number": 8, "title": title, "author": bot, "labels": [{"name": "bug"}]},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "issues.json").write_text(json.dumps(issues), encoding="utf-8")
+            gh = Path(tmp) / "gh"
+            gh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/args"\ncat "$(dirname "$0")/issues.json"\n',
+                          encoding="utf-8")
+            gh.chmod(0o755)
+            env = {"PATH": f"{tmp}:/usr/bin:/bin", "HOME": tmp, "REPO": "o/r", "TITLE": title, "LABEL": label}
+            proc = subprocess.run(["/bin/bash", str(scripts / "arch_digest_reminders.sh")],
+                                  capture_output=True, text=True, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.split(), ["3", "9"])
+            args = (Path(tmp) / "args").read_text(encoding="utf-8").splitlines()
+            for flag, value in (("--author", "github-actions[bot]"), ("--label", label), ("--state", "open")):
+                self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_reminder_workflow_uses_the_filtered_lookup(self) -> None:
+        wf = (ROOT / ".github/workflows/arch-digest.yml").read_text(encoding="utf-8")
+        self.assertNotIn("--search", wf)
+        self.assertEqual(wf.count("bash scripts/arch_digest_reminders.sh"), 2)
+        self.assertIn('--label "$LABEL"', wf)
+        self.assertIn("gh issue close", wf)
+        for block in wf.split("run: |")[1:]:
+            self.assertNotIn("${{", block.split("\n      - ")[0])
+
     def test_image_is_digest_pinned_and_shared(self) -> None:
         self.assertRegex(up.MOON_SANDBOX_IMAGE, r"^archlinux:base-devel@sha256:[0-9a-f]{64}$")
         scripts = Path(up.__file__).resolve().parent
