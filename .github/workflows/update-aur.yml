@@ -3,7 +3,8 @@ name: Update AUR packages
 # Trust boundary: build runs untrusted upstream code (makepkg -s) in a second
 # container that cannot see the sealed PKGBUILD. The build job has
 # contents: read, no AUR key, and persist-credentials: false. Only the sealed
-# PKGBUILD leaves via an artifact. publish checks out main again, regenerates
+# PKGBUILD leaves via an artifact. publish checks out main again, recomputes
+# the expected pkgver of -git packages from upstream itself, regenerates
 # .SRCINFO with makepkg --printsrcinfo, and is the only job in the aur
 # environment, the only job with AUR_SSH_PRIVATE_KEY, and the only job with
 # contents: write.
@@ -208,17 +209,36 @@ jobs:
           echo "no publish artifact for ${PACKAGE}; the build job did not produce one" >&2
           exit 1
 
+      # -git only: recompute pkgver on this host from upstream. The artifact
+      # pkgver only names a commit; it must be on the upstream default branch
+      # and the expected value is git describe of it with update_package.py's
+      # transform. import rejects any artifact pkgver that differs.
+      - name: Compute expected pkgver on the host
+        id: expect
+        if: steps.download.outcome == 'success' && endsWith(matrix.package, '-git')
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          set -euo pipefail
+          python3 scripts/publish_artifact.py expect \
+            --package "$PACKAGE" \
+            --artifact "${RUNNER_TEMP}/aur-artifact"
+
       - name: Import artifact
         id: import
         if: steps.download.outcome == 'success'
         env:
           PACKAGE: ${{ matrix.package }}
+          EXPECTED_PKGVER: ${{ steps.expect.outputs.pkgver }}
+          EXPECTED_COMMIT: ${{ steps.expect.outputs.commit }}
         run: |
           set -euo pipefail
           python3 scripts/publish_artifact.py import \
             --package "$PACKAGE" \
             --artifact "${RUNNER_TEMP}/aur-artifact" \
-            --dest "${GITHUB_WORKSPACE}/${PACKAGE}"
+            --dest "${GITHUB_WORKSPACE}/${PACKAGE}" \
+            --expected-pkgver "$EXPECTED_PKGVER" \
+            --expected-commit "$EXPECTED_COMMIT"
 
       - name: Regenerate .SRCINFO
         if: steps.import.outputs.publish == 'true'
