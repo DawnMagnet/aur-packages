@@ -14,6 +14,10 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from alpmver import vercmp
@@ -321,6 +325,233 @@ def decode_expected_sources(package: str, raw: str | None) -> dict[str, list[str
     return data
 
 
+# Host-side checksums for release packages. The checksum arrays in the
+# artifact come from updpkgsums inside the build container, so for
+# RELEASE_PACKAGES the publish host downloads every source itself and import
+# requires the artifact's sha256sums / sha256sums_<arch> to equal those values.
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+SUMS_NAME_RE = re.compile(r"sha256sums(?:_[A-Za-z0-9_]+)?")
+SOURCE_NAME_RE = re.compile(r"source(?:_[A-Za-z0-9_]+)?")
+LOCAL_SOURCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,254}")
+URL_CHARS_RE = re.compile(r"https://[A-Za-z0-9._~:/?#@%+=&!,;-]{1,2000}")
+HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
+VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+EXPAND_VARS = ("pkgname", "pkgver", "pkgrel")
+DOWNLOAD_MAX_BYTES = 1024 * 1024 * 1024
+DOWNLOAD_TIMEOUT = 30
+DOWNLOAD_DEADLINE = 900
+DOWNLOAD_CHUNK = 1024 * 1024
+MAX_REDIRECTS = 5
+
+
+def sums_name(source_name: str) -> str:
+    """source -> sha256sums, source_<arch> -> sha256sums_<arch>."""
+    if not SOURCE_NAME_RE.fullmatch(source_name):
+        die(f"invalid source array name {source_name!r}")
+    return "sha256sums" + source_name[len("source"):]
+
+
+def check_https_url(url: str) -> str:
+    """Refuse anything but a plain https URL without credentials."""
+    if not URL_CHARS_RE.fullmatch(url):
+        die(f"refusing source URL {url!r}: only plain https:// URLs are downloaded")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.username is not None or parts.password is not None:
+        die(f"refusing source URL {url!r}: https without credentials only")
+    host = parts.hostname or ""
+    if not HOST_RE.fullmatch(host):
+        die(f"refusing source URL {url!r}: bad host")
+    try:
+        port = parts.port
+    except ValueError:
+        die(f"refusing source URL {url!r}: bad port")
+    if port not in (None, 443):
+        die(f"refusing source URL {url!r}: only port 443")
+    return urllib.parse.urlunsplit(parts._replace(fragment=""))
+
+
+def expand_source(package: str, item: str, variables: dict[str, str]) -> str:
+    """Expand $pkgname/$pkgver/$pkgrel in a source item; refuse any other $."""
+
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        if name not in variables:
+            die(f"{package}: source item {item!r} uses ${name}; only {', '.join(EXPAND_VARS)} are expanded")
+        return variables[name]
+
+    if "$" in VAR_RE.sub("", item):
+        die(f"{package}: unsupported expansion in source item {item!r}")
+    return VAR_RE.sub(repl, item)
+
+
+def source_target(package: str, item: str, variables: dict[str, str]) -> tuple[str, str]:
+    """Return ("url", https URL without fragment) or ("file", local file name)."""
+    expanded = expand_source(package, item, variables)
+    location = expanded.split("::", 1)[1] if "::" in expanded else expanded
+    if "://" in location:
+        return "url", check_https_url(location)
+    if not LOCAL_SOURCE_RE.fullmatch(location) or location in (".", ".."):
+        die(f"{package}: refusing local source {item!r}")
+    return "file", location
+
+
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_https_url(newurl)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            # Never forward credentials across a redirect (none are set, this is a guard).
+            for name in ("Authorization", "Cookie", "Proxy-authorization"):
+                new.remove_header(name)
+        return new
+
+
+def fetch_sha256(url: str) -> str:
+    """Download url (https only, no credentials) and return its sha256.
+
+    Redirects must stay on https (at most MAX_REDIRECTS). The body is hashed
+    while streaming and never written to disk. More than DOWNLOAD_MAX_BYTES,
+    a socket stall over DOWNLOAD_TIMEOUT, or a total time over
+    DOWNLOAD_DEADLINE fails.
+    """
+    url = check_https_url(url)
+    opener = urllib.request.build_opener(_HttpsOnlyRedirect())
+    request = urllib.request.Request(url, headers={"User-Agent": "aur-packages", "Accept": "*/*"})
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with opener.open(request, timeout=DOWNLOAD_TIMEOUT) as resp:
+            check_https_url(resp.geturl())
+            if resp.status != 200:
+                die(f"download of {url} returned HTTP {resp.status}")
+            length = resp.headers.get("Content-Length")
+            if length is not None and (not length.isdigit() or int(length) > DOWNLOAD_MAX_BYTES):
+                die(f"download of {url} is too large or has a bad Content-Length: {length!r}")
+            while True:
+                if time.monotonic() > deadline:
+                    die(f"download of {url} took longer than {DOWNLOAD_DEADLINE} s")
+                chunk = resp.read(DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > DOWNLOAD_MAX_BYTES:
+                    die(f"download of {url} is larger than {DOWNLOAD_MAX_BYTES} bytes")
+                digest.update(chunk)
+            if length is not None and total != int(length):
+                die(f"download of {url} is truncated: {total} of {length} bytes")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        die(f"download of {url} failed: {exc}")
+    return digest.hexdigest()
+
+
+def hash_local_source(package: str, pkgdir: Path, name: str) -> str:
+    path = pkgdir / name
+    if path.is_symlink() or not path.is_file():
+        die(f"{package}: local source {name} must be a regular file in {pkgdir.name}/")
+    size = path.stat().st_size
+    if size > DOWNLOAD_MAX_BYTES:
+        die(f"{package}: local source {name} is too large")
+    data = path.read_bytes()
+    if len(data) != size:
+        die(f"{package}: local source {name} changed while it was being read")
+    return hashlib.sha256(data).hexdigest()
+
+
+def host_sha256sums(
+    package: str,
+    sources: dict[str, list[str]],
+    expected_text: str,
+    pkgdir: Path,
+    fetch=None,
+) -> dict[str, list[str]]:
+    """sha256 of every item of the host-expected source arrays, per array.
+
+    URLs are downloaded on this host (fetch, default fetch_sha256); local
+    files are hashed from the clean checkout, which is what publish.sh pushes.
+    """
+    fetch = fetch or fetch_sha256
+    variables = {name: read_var(expected_text, name) for name in EXPAND_VARS}
+    for name, value in variables.items():
+        if not PKG_RE.fullmatch(value):
+            die(f"{package}: refusing {name}={value!r} for source expansion")
+    sums: dict[str, list[str]] = {}
+    for name in sorted(sources):
+        if not sources[name]:
+            die(f"{package}: {name} is empty")
+        values = []
+        for item in sources[name]:
+            kind, target = source_target(package, item, variables)
+            if kind == "url":
+                digest = fetch(target)
+            else:
+                digest = hash_local_source(package, pkgdir, target)
+            if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+                die(f"{package}: bad sha256 for {item!r}")
+            values.append(digest)
+        sums[sums_name(name)] = values
+    return sums
+
+
+def parse_checksums(package: str, text: str) -> dict[str, list[str]]:
+    """Return every top-level <algo>sums[_<arch>] array of a PKGBUILD."""
+    lines = text.splitlines()
+    arrays: dict[str, list[str]] = {}
+    index = 0
+    while index < len(lines):
+        if not SUM_START_RE.match(lines[index]):
+            index += 1
+            continue
+        name = lines[index].split("=(", 1)[0]
+        match, body, index = consume_sum_block(lines, index)
+        validate_sum_body(package, match, body)
+        if name in arrays:
+            die(f"{package}: {name} is assigned twice")
+        arrays[name] = re.findall(r"'([^']*)'", body)
+    return arrays
+
+
+def decode_expected_sha256sums(
+    package: str, raw: str | None, sources: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    if not raw:
+        die(f"{package}: missing host-computed --expected-sha256sums; refusing to import")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"{package}: invalid --expected-sha256sums: {exc}")
+    if not isinstance(data, dict) or not data or not all(
+        isinstance(k, str) and SUMS_NAME_RE.fullmatch(k)
+        and isinstance(v, list) and v and all(isinstance(i, str) and SHA256_RE.fullmatch(i) for i in v)
+        for k, v in data.items()
+    ):
+        die(f"{package}: invalid --expected-sha256sums")
+    want = {sums_name(name): len(items) for name, items in sources.items()}
+    if {k: len(v) for k, v in data.items()} != want:
+        die(f"{package}: --expected-sha256sums does not cover --expected-sources item for item")
+    return data
+
+
+def assert_sha256sums(package: str, expected: dict[str, list[str]], updated: str) -> None:
+    """Require the artifact checksum arrays to equal the host-computed sha256s."""
+    actual = parse_checksums(package, updated)
+    for name in sorted(set(expected) | set(actual)):
+        if name not in actual:
+            die(f"{package}: artifact is missing {name} (computed on the host)")
+        if name not in expected:
+            die(f"{package}: artifact adds {name}, which the host did not compute")
+        want, got = expected[name], actual[name]
+        for pos in range(max(len(want), len(got))):
+            if pos >= len(got):
+                die(f"{package}: {name}[{pos}] is missing; the host computed {want[pos]}")
+            if pos >= len(want):
+                die(f"{package}: {name}[{pos}] {got[pos]} is extra; the host computed {len(want)} items")
+            if want[pos] != got[pos]:
+                die(f"{package}: {name}[{pos}] is {got[pos]}, the host computed {want[pos]}")
+
+
 def assert_baseline_version(package: str, baseline: str, candidate: str) -> None:
     """stage / check-pkgbuild: the build may not choose its own version.
 
@@ -578,13 +809,15 @@ def expect(package: str, artifact: Path) -> None:
     set_output("commit", commit)
 
 
-def expect_release(package: str, artifact: Path, main_pkgbuild: Path) -> None:
-    """Compute the expected pkgver and pkgrel of a release package on the host.
+def expect_release(package: str, artifact: Path, main_pkgbuild: Path, fetch=None) -> None:
+    """Compute the expected pkgver, pkgrel, sources and sha256sums on the host.
 
     Runs the updater's version logic read-only (update_package.expected_release)
-    against the PKGBUILD on main. The artifact is only read to see whether it is
-    a skip marker, in which case nothing is downloaded and both outputs are
-    empty. Writes the outputs pkgver and pkgrel.
+    against the PKGBUILD on main, then downloads every source URL of the
+    expected source arrays on this host (host_sha256sums; local sources are
+    hashed from the checkout). The artifact is only read to see whether it is
+    a skip marker, in which case nothing is downloaded and all outputs are
+    empty. Writes the outputs pkgver, pkgrel, sources and sha256sums (JSON).
     """
     validate_package(package)
     if package not in update_package.RELEASE_PACKAGES:
@@ -594,6 +827,7 @@ def expect_release(package: str, artifact: Path, main_pkgbuild: Path) -> None:
         set_output("pkgver", "")
         set_output("pkgrel", "")
         set_output("sources", "")
+        set_output("sha256sums", "")
         return
     main_text = read_text_file(main_pkgbuild)
     if read_var(main_text, "pkgname") != package:
@@ -602,9 +836,11 @@ def expect_release(package: str, artifact: Path, main_pkgbuild: Path) -> None:
     sources = parse_sources(package, expected_text)
     if not sources:
         die(f"{package}: the expected PKGBUILD has no source array")
+    sums = host_sha256sums(package, sources, expected_text, main_pkgbuild.parent, fetch)
     set_output("pkgver", pkgver)
     set_output("pkgrel", pkgrel)
     set_output("sources", json.dumps(sources, separators=(",", ":"), sort_keys=True))
+    set_output("sha256sums", json.dumps(sums, separators=(",", ":"), sort_keys=True))
 
 
 def require_registered(package: str) -> None:
@@ -638,6 +874,7 @@ def import_artifact(
     expected_commit: str | None = None,
     expected_pkgrel: str | None = None,
     expected_sources: str | None = None,
+    expected_sha256sums: str | None = None,
 ) -> None:
     validate_package(package)
     require_registered(package)
@@ -661,8 +898,14 @@ def import_artifact(
     if package.endswith("-git"):
         assert_sources(package, parse_sources(package, current), pkgbuild, "main")
     elif package in update_package.RELEASE_PACKAGES:
-        assert_sources(
-            package, decode_expected_sources(package, expected_sources), pkgbuild, "the host"
+        host_sources = decode_expected_sources(package, expected_sources)
+        assert_sources(package, host_sources, pkgbuild, "the host")
+        # Checksums: exactly the sha256s the host downloaded and computed,
+        # not the ones updpkgsums wrote in the build container.
+        assert_sha256sums(
+            package,
+            decode_expected_sha256sums(package, expected_sha256sums, host_sources),
+            pkgbuild,
         )
     assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True, require_same_git_commit=False)
     if package.endswith("-git") or package in update_package.RELEASE_PACKAGES:
@@ -699,6 +942,7 @@ def main(argv: list[str]) -> int:
     import_cmd.add_argument("--expected-commit", default="")
     import_cmd.add_argument("--expected-pkgrel", default="")
     import_cmd.add_argument("--expected-sources", default="")
+    import_cmd.add_argument("--expected-sha256sums", default="")
 
     expect_cmd = sub.add_parser("expect")
     expect_cmd.add_argument("--package", required=True)
@@ -732,6 +976,7 @@ def main(argv: list[str]) -> int:
             args.expected_commit or None,
             args.expected_pkgrel or None,
             args.expected_sources or None,
+            args.expected_sha256sums or None,
         )
     return 0
 

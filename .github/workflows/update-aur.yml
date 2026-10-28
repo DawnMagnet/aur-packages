@@ -238,9 +238,13 @@ jobs:
 
       # Release packages: run the updater's version logic read-only on this
       # host against main's PKGBUILD (no writes into the checkout, no
-      # nvchecker, moonbit's `moon version` runs in a no-network container).
-      # import requires the artifact pkgver, pkgrel and source arrays to match
-      # exactly (-git packages: source arrays must equal main's).
+      # nvchecker, moonbit's `moon version` runs in a no-network container),
+      # then download every source URL of the expected source arrays here
+      # (https only, no credentials, size and time capped, hashed in memory)
+      # and hash local sources from the checkout. import requires the
+      # artifact pkgver, pkgrel, source arrays and sha256sums arrays to match
+      # exactly (-git packages: source arrays must equal main's). A skip
+      # artifact downloads nothing.
       - name: Compute expected release version on the host
         id: expect_release
         if: steps.download.outcome == 'success' && !endsWith(matrix.package, '-git')
@@ -263,6 +267,7 @@ jobs:
           EXPECTED_COMMIT: ${{ steps.expect.outputs.commit }}
           EXPECTED_PKGREL: ${{ steps.expect_release.outputs.pkgrel }}
           EXPECTED_SOURCES: ${{ steps.expect_release.outputs.sources }}
+          EXPECTED_SHA256SUMS: ${{ steps.expect_release.outputs.sha256sums }}
         run: |
           set -euo pipefail
           python3 scripts/publish_artifact.py import \
@@ -272,7 +277,8 @@ jobs:
             --expected-pkgver "$EXPECTED_PKGVER" \
             --expected-commit "$EXPECTED_COMMIT" \
             --expected-pkgrel "$EXPECTED_PKGREL" \
-            --expected-sources "$EXPECTED_SOURCES"
+            --expected-sources "$EXPECTED_SOURCES" \
+            --expected-sha256sums "$EXPECTED_SHA256SUMS"
 
       - name: Regenerate .SRCINFO
         if: steps.import.outputs.publish == 'true'

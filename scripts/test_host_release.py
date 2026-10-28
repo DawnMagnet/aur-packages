@@ -75,6 +75,59 @@ class FakeMoon:
         return f"moon {self.version} (3778465 2026-11-01)\n\nFeature flags enabled: x\n"
 
 
+def fake_sha(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
+class FakeFetch:
+    """Stands in for publish_artifact.fetch_sha256; never touches the network."""
+
+    def __init__(self, table: dict[str, str] | None = None, fail: str | None = None) -> None:
+        self.table = table or {}
+        self.fail = fail
+        self.urls: list[str] = []
+
+    def __call__(self, url: str) -> str:
+        self.urls.append(url)
+        if self.fail and self.fail in url:
+            gate.die(f"download of {url} failed: HTTP Error 404: Not Found")
+        return self.table.get(url) or fake_sha(url)
+
+
+def committed_fetch(package: str, text: str) -> FakeFetch:
+    """A fake downloader that returns the sums committed in text for its URLs."""
+    sources = gate.parse_sources(package, text)
+    sums = gate.parse_checksums(package, text)
+    variables = {n: up.read_var(text, n) for n in gate.EXPAND_VARS}
+    table = {}
+    for name, items in sources.items():
+        for item, digest in zip(items, sums[gate.sums_name(name)]):
+            kind, target = gate.source_target(package, item, variables)
+            if kind == "url":
+                table[target] = digest
+    return FakeFetch(table)
+
+
+def sums_of(text: str) -> str:
+    sums = gate.parse_checksums("test", text)
+    return json.dumps({k: v for k, v in sums.items() if k.startswith("sha256sums")})
+
+
+def with_sums(package: str, text: str, sums: dict[str, list[str]]) -> str:
+    """Replace the checksum arrays of text with sums (same names)."""
+    lines = text.splitlines()
+    out, index = [], 0
+    while index < len(lines):
+        if gate.SUM_START_RE.match(lines[index]):
+            name = lines[index].split("=(", 1)[0]
+            _m, _b, index = gate.consume_sum_block(lines, index)
+            out.append(f"{name}=(" + " ".join(f"'{v}'" for v in sums[name]) + ")")
+            continue
+        out.append(lines[index])
+        index += 1
+    return "\n".join(out) + "\n"
+
+
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -93,6 +146,10 @@ class Base(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         p = mock.patch.object(up, "nvchecker_version", no_nvchecker)
+        p.start()
+        self.addCleanup(p.stop)
+        self.fetch = FakeFetch()
+        p = mock.patch.object(gate, "fetch_sha256", self.fetch)
         p.start()
         self.addCleanup(p.stop)
         self.out = self.tmp / "github_output"
@@ -214,6 +271,10 @@ class ExpectReleaseTest(Base):
             json.loads(outs["sources"]),
             {"source": ["https://github.com/subframe7536/maple-font/releases/download/v$pkgver/MapleMono-NF-CN-unhinted.zip"]},
         )
+        # The host downloads the expanded URL of the new version itself.
+        url = "https://github.com/subframe7536/maple-font/releases/download/v7.10/MapleMono-NF-CN-unhinted.zip"
+        self.assertEqual(self.fetch.urls, [url])
+        self.assertEqual(json.loads(outs["sha256sums"]), {"sha256sums": [fake_sha(url)]})
         self.assertEqual(tree_digest(self.root), before)
 
     def test_moonbit_writes_nothing_into_the_checkout(self) -> None:
@@ -238,9 +299,12 @@ class ExpectReleaseTest(Base):
         def boom(*_a, **_k):
             raise AssertionError("must not probe upstream for a skip artifact")
 
-        with mock.patch.object(up, "expected_release", boom):
-            gate.expect_release("moonbit-bin", art, self.root / "moonbit-bin/PKGBUILD")
-        self.assertEqual(self.outputs(), {"pkgver": "", "pkgrel": "", "sources": ""})
+        with mock.patch.object(up, "expected_release", boom), mock.patch.object(
+            up, "expected_release_pkgbuild", boom
+        ):
+            gate.expect_release("moonbit-bin", art, self.root / "moonbit-bin/PKGBUILD", boom)
+        self.assertEqual(self.outputs(), {"pkgver": "", "pkgrel": "", "sources": "", "sha256sums": ""})
+        self.assertEqual(self.fetch.urls, [])
 
     def test_refuses_git_packages_and_wrong_main(self) -> None:
         art = self.artifact(f"pkgname=reflectcpp-git\npkgver=1.r0.gabcdef1\npkgrel=1\nsha256sums=('{H1}')\n")
@@ -266,18 +330,20 @@ class ExpectReleaseTest(Base):
                 with mock.patch.object(up.subprocess, "check_call", fake.check_call), mock.patch.object(
                     up.subprocess, "check_output", fake.check_output
                 ):
-                    gate.expect_release("moonbit-bin", art, main)
+                    gate.expect_release("moonbit-bin", art, main, committed_fetch("moonbit-bin", text))
                 outs = self.outputs()
+                self.assertEqual(json.loads(outs["sha256sums"]), json.loads(sums_of(text)))
                 dest = self.tmp / "dest" / "moonbit-bin"
                 if dest.exists():
                     shutil.rmtree(dest)
                 dest.mkdir(parents=True)
                 (dest / "PKGBUILD").write_text(text, encoding="utf-8")
+                host = (outs["pkgver"], None, outs["pkgrel"], outs["sources"], outs["sha256sums"])
                 if ok:
-                    gate.import_artifact("moonbit-bin", art, dest, outs["pkgver"], None, outs["pkgrel"], outs["sources"])
+                    gate.import_artifact("moonbit-bin", art, dest, *host)
                 else:
                     with self.assertRaises(SystemExit):
-                        gate.import_artifact("moonbit-bin", art, dest, outs["pkgver"], None, outs["pkgrel"], outs["sources"])
+                        gate.import_artifact("moonbit-bin", art, dest, *host)
                     self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), text)
 
 
@@ -305,7 +371,7 @@ class SourceLockTest(unittest.TestCase):
             commit = up.GIT_HASH_RE.search(ver).group(1).ljust(40, "0")
             gate.import_artifact(package, art, dest, ver, commit)
         else:
-            gate.import_artifact(package, art, dest, ver, None, rel, expected_sources)
+            gate.import_artifact(package, art, dest, ver, None, rel, expected_sources, sums_of(updated))
         return (dest / "PKGBUILD").read_text(encoding="utf-8")
 
     def real(self, package: str) -> str:
@@ -527,7 +593,7 @@ class VersionRuleTest(unittest.TestCase):
                 gate.import_artifact(package, art, dest, host_ver, commit)
             else:
                 sources = json.dumps(gate.parse_sources(package, main))
-                gate.import_artifact(package, art, dest, host_ver, None, host_rel, sources)
+                gate.import_artifact(package, art, dest, host_ver, None, host_rel, sources, sums_of(cand))
 
     def test_import_end_to_end_even_if_host_agrees(self) -> None:
         # The pkgrel rule holds even when the host-computed values agree with
@@ -557,6 +623,346 @@ class VersionRuleTest(unittest.TestCase):
                 self.assertIn("does not match the host-computed pkgver", str(caught.exception))
 
 
+class FakeResponse:
+    def __init__(self, body: bytes, *, url: str, status: int = 200, length: str | None = "auto",
+                 chunk_delay: float = 0.0, clock=None) -> None:
+        self.body = body
+        self.pos = 0
+        self.url = url
+        self.status = status
+        self.headers = {} if length is None else {"Content-Length": str(len(body)) if length == "auto" else length}
+        self.clock = clock
+
+    def geturl(self) -> str:
+        return self.url
+
+    def read(self, size: int) -> bytes:
+        if self.clock is not None:
+            self.clock.tick()
+        chunk = self.body[self.pos:self.pos + size]
+        self.pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        return None
+
+
+class FakeOpener:
+    def __init__(self, response=None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+class Clock:
+    def __init__(self, step: float) -> None:
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self) -> None:
+        self.now += self.step
+
+
+class HostSha256Test(unittest.TestCase):
+    """Host-side sha256 of release sources; downloads are always injected."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        p = mock.patch.object(gate, "fetch_sha256", FakeFetch(fail="https://"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def real(self, package: str) -> str:
+        return (ROOT / package / "PKGBUILD").read_text(encoding="utf-8")
+
+    VARS = {"pkgname": "moonbit-bin", "pkgver": "0.1.20261023", "pkgrel": "2"}
+
+    def test_source_targets(self) -> None:
+        cases = {
+            "https://a.example/v$pkgver/x.zip": ("url", "https://a.example/v0.1.20261023/x.zip"),
+            "https://a.example/${pkgname}-${pkgver}-${pkgrel}.tar.gz": ("url", "https://a.example/moonbit-bin-0.1.20261023-2.tar.gz"),
+            "https://a.example/latest.tar.gz#filename=${pkgname}-${pkgver}.tar.gz": ("url", "https://a.example/latest.tar.gz"),
+            "renamed-${pkgver}.zip::https://a.example/x.zip": ("url", "https://a.example/x.zip"),
+            "https://a.example:443/x?y=1&z=2": ("url", "https://a.example:443/x?y=1&z=2"),
+            "moon.sh": ("file", "moon.sh"),
+        }
+        for item, want in cases.items():
+            with self.subTest(item=item):
+                self.assertEqual(gate.source_target("moonbit-bin", item, self.VARS), want)
+
+    def test_refused_sources(self) -> None:
+        bad = [
+            "http://a.example/x.zip",
+            "ftp://a.example/x.zip",
+            "file:///etc/passwd",
+            "git+https://github.com/a/b.git",
+            "https://user:pw@a.example/x.zip",
+            "https://token@a.example/x.zip",
+            "https://a.example:8443/x.zip",
+            "https:///x.zip",
+            "https://a.example/$_origin/x",
+            "https://a.example/$HOME/x",
+            "https://a.example/${pkgver:0:3}/x",
+            "https://a.example/$/x",
+            "https://a.example/x y",
+            "../moon.sh",
+            "sub/moon.sh",
+            "/etc/passwd",
+            "..",
+        ]
+        for item in bad:
+            with self.subTest(item=item):
+                with self.assertRaises(SystemExit):
+                    gate.source_target("moonbit-bin", item, self.VARS)
+
+    def test_real_pkgbuilds_hash_to_their_committed_sums_offline(self) -> None:
+        for package in up.RELEASE_PACKAGES:
+            with self.subTest(package=package):
+                text = self.real(package)
+                fetch = committed_fetch(package, text)
+                sums = gate.host_sha256sums(package, gate.parse_sources(package, text), text, ROOT / package, fetch)
+                self.assertEqual(sums, json.loads(sums_of(text)))
+                self.assertTrue(fetch.urls)
+                self.assertTrue(all(u.startswith("https://") and "#" not in u for u in fetch.urls))
+        # moonbit's moon.sh is hashed from the checkout, not downloaded.
+        fetch = committed_fetch("moonbit-bin", self.real("moonbit-bin"))
+        gate.host_sha256sums("moonbit-bin", gate.parse_sources("moonbit-bin", self.real("moonbit-bin")),
+                             self.real("moonbit-bin"), ROOT / "moonbit-bin", fetch)
+        self.assertEqual(len(fetch.urls), 2)
+        self.assertFalse([u for u in fetch.urls if "moon.sh" in u])
+
+    def test_local_source_must_be_a_regular_file_in_the_checkout(self) -> None:
+        text = self.real("moonbit-bin")
+        sources = gate.parse_sources("moonbit-bin", text)
+        pkgdir = self.tmp / "moonbit-bin"
+        pkgdir.mkdir()
+        fetch = committed_fetch("moonbit-bin", text)
+        with self.assertRaises(SystemExit) as caught:
+            gate.host_sha256sums("moonbit-bin", sources, text, pkgdir, fetch)
+        self.assertIn("local source moon.sh must be a regular file", str(caught.exception))
+        (self.tmp / "elsewhere").write_text("x\n", encoding="utf-8")
+        (pkgdir / "moon.sh").symlink_to(self.tmp / "elsewhere")
+        with self.assertRaises(SystemExit):
+            gate.host_sha256sums("moonbit-bin", sources, text, pkgdir, fetch)
+
+    def test_download_failure_fails_closed_and_writes_no_output(self) -> None:
+        text = self.real("maple-mono-nf-cn")
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            art = Path(tmp) / "a"
+            art.mkdir()
+            (art / "PKGBUILD").write_text(text, encoding="utf-8")
+            gate.write_manifest(art, "publish", {"PKGBUILD": (art / "PKGBUILD").read_bytes()})
+            ver = up.read_var(text, "pkgver")
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}), mock.patch.object(
+                up, "stable_github_version", lambda repo, prefix: ver
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    gate.expect_release("maple-mono-nf-cn", art, ROOT / "maple-mono-nf-cn/PKGBUILD",
+                                        FakeFetch(fail="MapleMono"))
+            self.assertIn("failed", str(caught.exception))
+            self.assertFalse(out.exists())
+
+    def run_import(self, package: str, updated: str, sums: str | None, sources: str | None = None) -> None:
+        current = self.real(package)
+        for leftover in (self.tmp / "a", self.tmp / package):
+            if leftover.exists():
+                shutil.rmtree(leftover)
+        art = self.tmp / "a"
+        art.mkdir()
+        (art / "PKGBUILD").write_text(updated, encoding="utf-8")
+        gate.write_manifest(art, "publish", {"PKGBUILD": (art / "PKGBUILD").read_bytes()})
+        dest = self.tmp / package
+        dest.mkdir()
+        (dest / "PKGBUILD").write_text(current, encoding="utf-8")
+        sources = sources or json.dumps(gate.parse_sources(package, current))
+        try:
+            gate.import_artifact(package, art, dest, up.read_var(current, "pkgver"), None,
+                                 up.read_var(current, "pkgrel"), sources, sums)
+        finally:
+            self.after = (dest / "PKGBUILD").read_text(encoding="utf-8")
+
+    def test_import_accepts_exact_host_sums(self) -> None:
+        for package in up.RELEASE_PACKAGES:
+            with self.subTest(package=package):
+                text = self.real(package)
+                self.run_import(package, text, sums_of(text))
+
+    def test_import_refuses_any_checksum_difference(self) -> None:
+        for package in up.RELEASE_PACKAGES:
+            text = self.real(package)
+            host = json.loads(sums_of(text))
+            name = sorted(host)[0]
+            n = len(host[name])
+            cases = [
+                ("mismatch", {**host, name: [H1] + host[name][1:]}, f"{name}[0] is {H1}, the host computed"),
+                ("extra item", {**host, name: host[name] + [H1]}, f"{name}[{n}] {H1} is extra"),
+                ("missing array", {k: v for k, v in host.items() if k != name}, f"artifact is missing {name}"),
+                ("added array", {**host, "sha256sums_i686": [H1]}, "artifact adds sha256sums_i686"),
+                ("missing item", {**host, name: host[name][:-1]},
+                 f"{name}[{n - 1}] is missing" if n > 1 else "illegal checksum entry"),
+            ]
+            for label, artifact_sums, needle in cases:
+                with self.subTest(package=package, case=label):
+                    if label in ("missing array", "added array", "missing item"):
+                        # Rebuild the artifact arrays from scratch so names can come and go.
+                        lines = [l for l in with_sums(package, text, {k: host.get(k, [H1]) for k in host}).splitlines()
+                                 if not gate.SUM_START_RE.match(l)]
+                        bad = "\n".join(lines) + "\n" + "".join(
+                            f"{k}=(" + " ".join(f"'{v}'" for v in vals) + ")\n" for k, vals in artifact_sums.items()
+                        )
+                    else:
+                        bad = with_sums(package, text, artifact_sums)
+                    with self.assertRaises(SystemExit) as caught:
+                        self.run_import(package, bad, json.dumps(host))
+                    if needle != "illegal checksum entry":  # validate_sum_body: empty array
+                        self.assertIn(package, str(caught.exception))
+                    self.assertIn(needle, str(caught.exception))
+                    self.assertEqual(self.after, text)
+
+    def test_import_refuses_other_algorithms(self) -> None:
+        text = self.real("maple-mono-nf-cn")
+        bad = text.replace("sha256sums=(", "b2sums=('" + "ab" * 64 + "')\nsha256sums=(")
+        with self.assertRaises(SystemExit) as caught:
+            self.run_import("maple-mono-nf-cn", bad, sums_of(text))
+        self.assertIn("artifact adds b2sums", str(caught.exception))
+        self.assertEqual(self.after, text)
+
+    def test_missing_or_bad_expected_sha256sums_fail_closed(self) -> None:
+        text = self.real("memprocfs")
+        good = json.loads(sums_of(text))
+        cases = [
+            (None, "missing host-computed --expected-sha256sums"),
+            ("", "missing host-computed --expected-sha256sums"),
+            ("not json", "invalid --expected-sha256sums"),
+            ("{}", "invalid --expected-sha256sums"),
+            ('{"md5sums_x86_64": ["' + "ab" * 16 + '"]}', "invalid --expected-sha256sums"),
+            (json.dumps({**good, "sha256sums_x86_64": ["AB" * 32]}), "invalid --expected-sha256sums"),
+            (json.dumps({**good, "sha256sums_x86_64": []}), "invalid --expected-sha256sums"),
+            (json.dumps({**good, "sha256sums_x86_64": ["SKIP"]}), "invalid --expected-sha256sums"),
+            (json.dumps({"sha256sums_x86_64": good["sha256sums_x86_64"]}), "does not cover --expected-sources"),
+            (json.dumps({**good, "sha256sums_aarch64": good["sha256sums_aarch64"] * 2}), "does not cover"),
+        ]
+        for raw, needle in cases:
+            with self.subTest(raw=raw):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_import("memprocfs", text, raw)
+                self.assertIn(needle, str(caught.exception))
+                self.assertEqual(self.after, text)
+
+    def test_git_import_needs_no_sums(self) -> None:
+        for package in ("reflectcpp-git", "cuda-api-wrappers-git"):
+            text = self.real(package)
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                art = root / "a"
+                art.mkdir()
+                (art / "PKGBUILD").write_text(text, encoding="utf-8")
+                gate.write_manifest(art, "publish", {"PKGBUILD": (art / "PKGBUILD").read_bytes()})
+                dest = root / package
+                dest.mkdir()
+                (dest / "PKGBUILD").write_text(text, encoding="utf-8")
+                ver = up.read_var(text, "pkgver")
+                commit = up.GIT_HASH_RE.search(ver).group(1).ljust(40, "0")
+                with mock.patch.object(gate, "fetch_sha256", side_effect=AssertionError("no downloads for -git")):
+                    gate.import_artifact(package, art, dest, ver, commit)
+
+    # fetch_sha256 itself, with urllib replaced by fakes.
+
+    def fetch_with(self, opener: FakeOpener, url: str = "https://a.example/x.tar.gz", clock=None) -> str:
+        patches = [mock.patch.object(gate.urllib.request, "build_opener", lambda *h: opener)]
+        if clock is not None:
+            patches.append(mock.patch.object(gate.time, "monotonic", clock))
+        for p in patches:
+            p.start()
+        try:
+            return REAL_FETCH(url)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_fetch_hashes_the_stream_without_credentials(self) -> None:
+        body = b"x" * (3 * gate.DOWNLOAD_CHUNK + 7)
+        opener = FakeOpener(FakeResponse(body, url="https://cdn.example/x.tar.gz"))
+        self.assertEqual(self.fetch_with(opener), hashlib.sha256(body).hexdigest())
+        request, timeout = opener.requests[0]
+        self.assertEqual(request.full_url, "https://a.example/x.tar.gz")
+        self.assertEqual(timeout, gate.DOWNLOAD_TIMEOUT)
+        headers = {k.lower() for k, _v in request.header_items()}
+        self.assertFalse(headers & {"authorization", "cookie", "proxy-authorization"})
+        self.assertNotIn("GITHUB_TOKEN", repr(request.header_items()))
+
+    def test_fetch_fails_closed(self) -> None:
+        big = gate.DOWNLOAD_MAX_BYTES + 1
+        cases = [
+            ("http error", FakeOpener(error=gate.urllib.error.HTTPError("https://a.example/x", 404, "Not Found", {}, None)), "failed"),
+            ("dns", FakeOpener(error=gate.urllib.error.URLError("no host")), "failed"),
+            ("timeout", FakeOpener(error=TimeoutError("timed out")), "failed"),
+            ("status", FakeOpener(FakeResponse(b"", url="https://a.example/x", status=206)), "HTTP 206"),
+            ("declared too large", FakeOpener(FakeResponse(b"", url="https://a.example/x", length=str(big))), "too large"),
+            ("bad length", FakeOpener(FakeResponse(b"", url="https://a.example/x", length="12x")), "bad Content-Length"),
+            ("truncated", FakeOpener(FakeResponse(b"abc", url="https://a.example/x", length="10")), "truncated"),
+            ("ended on http", FakeOpener(FakeResponse(b"abc", url="http://a.example/x")), "refusing source URL"),
+        ]
+        for label, opener, needle in cases:
+            with self.subTest(case=label):
+                with self.assertRaises(SystemExit) as caught:
+                    self.fetch_with(opener)
+                self.assertIn(needle, str(caught.exception))
+        with self.subTest(case="refused before any request"):
+            opener = FakeOpener(FakeResponse(b"", url="https://a.example/x"))
+            with self.assertRaises(SystemExit):
+                self.fetch_with(opener, "http://a.example/x")
+            self.assertEqual(opener.requests, [])
+
+    def test_fetch_size_cap_without_content_length(self) -> None:
+        with mock.patch.object(gate, "DOWNLOAD_MAX_BYTES", 10):
+            opener = FakeOpener(FakeResponse(b"x" * 11, url="https://a.example/x", length=None))
+            with self.assertRaises(SystemExit) as caught:
+                self.fetch_with(opener)
+        self.assertIn("larger than 10 bytes", str(caught.exception))
+
+    def test_fetch_total_deadline(self) -> None:
+        # A server that keeps sending slowly is cut off by the total deadline,
+        # not only by the per-read socket timeout.
+        clock = Clock(step=gate.DOWNLOAD_DEADLINE / 3)
+        body = b"x" * (10 * gate.DOWNLOAD_CHUNK)
+        opener = FakeOpener(FakeResponse(body, url="https://a.example/x", clock=clock))
+        with self.assertRaises(SystemExit) as caught:
+            self.fetch_with(opener, clock=clock)
+        self.assertIn("took longer than", str(caught.exception))
+
+    def test_redirects_stay_on_https(self) -> None:
+        handler = gate._HttpsOnlyRedirect()
+        self.assertEqual(handler.max_redirections, gate.MAX_REDIRECTS)
+        req = gate.urllib.request.Request("https://a.example/x")
+        for target in ("http://a.example/x", "file:///etc/passwd", "https://u:p@b.example/x", "ftp://b.example/x"):
+            with self.subTest(target=target):
+                with self.assertRaises(SystemExit):
+                    handler.redirect_request(req, None, 302, "Found", {}, target)
+        req.add_header("Authorization", "Bearer should-not-be-forwarded")
+        new = handler.redirect_request(req, None, 302, "Found", {}, "https://cdn.example/x")
+        self.assertEqual(new.full_url, "https://cdn.example/x")
+        self.assertFalse(new.has_header("Authorization"))
+
+
+REAL_FETCH = gate.fetch_sha256
+
+
 class WorkflowTest(unittest.TestCase):
     def test_publish_wires_release_expectation_into_import(self) -> None:
         text = (ROOT / ".github/workflows/update-aur.yml").read_text(encoding="utf-8")
@@ -575,6 +981,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn('--expected-pkgrel "$EXPECTED_PKGREL"', imp)
         self.assertIn("EXPECTED_SOURCES: ${{ steps.expect_release.outputs.sources }}", imp)
         self.assertIn('--expected-sources "$EXPECTED_SOURCES"', imp)
+        self.assertIn("EXPECTED_SHA256SUMS: ${{ steps.expect_release.outputs.sha256sums }}", imp)
+        self.assertIn('--expected-sha256sums "$EXPECTED_SHA256SUMS"', imp)
         self.assertNotIn("${{", imp.split("run: |", 1)[1])
         self.assertLess(publish.index("id: expect_release"), publish.index("id: import"))
 
