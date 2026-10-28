@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -210,6 +211,158 @@ def assert_pkgbuild_delta(
         die(f"PKGBUILD changed beyond pkgver, pkgrel, and checksums: {old!r} -> {new!r}")
 
 
+SOURCE_ASSIGN_RE = re.compile(r"^(source(?:_[A-Za-z0-9_]+)?)=\((.*)$")
+SOURCE_ANY_RE = re.compile(r"^\s*(?:declare\s+-a\s+|local\s+)?source(?:_[A-Za-z0-9_]*)?\+?=")
+# One array item: a double-quoted string without quotes, backslashes,
+# backticks or $( ; a single-quoted string; or a plain word.
+SOURCE_ITEM_RE = re.compile(
+    r"""\s*(?:"((?:[^"\\`$]|\$(?!\())*)"|'([^']*)'|([A-Za-z0-9._/:#=+@%~-]+))\s*"""
+)
+
+
+def parse_sources(package: str, text: str) -> dict[str, list[str]]:
+    """Return the top-level source arrays of a PKGBUILD, items unexpanded.
+
+    Pure text parsing; nothing is sourced or evaluated. Anything that is not
+    a plain top-level source=( ... ) / source_<arch>=( ... ) array of quoted
+    strings or words is refused.
+    """
+    lines = text.splitlines()
+    arrays: dict[str, list[str]] = {}
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = SOURCE_ASSIGN_RE.match(line)
+        if match is None:
+            if SOURCE_ANY_RE.match(line):
+                die(f"{package}: unsupported source assignment: {line!r}")
+            index += 1
+            continue
+        name, rest = match.group(1), match.group(2)
+        if name in arrays:
+            die(f"{package}: {name} is assigned twice")
+        body_parts = []
+        while True:
+            # A ) outside quotes closes the array.
+            close = _closing_paren(rest)
+            if close is not None:
+                body_parts.append(rest[:close])
+                if rest[close + 1 :].strip():
+                    die(f"{package}: trailing text after {name} array: {lines[index]!r}")
+                break
+            body_parts.append(rest)
+            index += 1
+            if index >= len(lines):
+                die(f"{package}: unclosed {name} array")
+            rest = lines[index]
+        arrays[name] = _source_items(package, name, "\n".join(body_parts))
+        index += 1
+    return arrays
+
+
+def _closing_paren(fragment: str) -> int | None:
+    quote = None
+    for pos, char in enumerate(fragment):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == ")":
+            return pos
+    return None
+
+
+def _source_items(package: str, name: str, body: str) -> list[str]:
+    items: list[str] = []
+    pos = 0
+    body = body.strip()
+    while pos < len(body):
+        match = SOURCE_ITEM_RE.match(body, pos)
+        if match is None or match.end() == pos:
+            die(f"{package}: unsupported item in {name}: {body[pos:pos + 60]!r}")
+        value = next(g for g in match.groups() if g is not None)
+        items.append(value)
+        pos = match.end()
+    return items
+
+
+def assert_sources(package: str, expected: dict[str, list[str]], updated: str, origin: str) -> None:
+    """Require the artifact source arrays to equal expected exactly."""
+    actual = parse_sources(package, updated)
+    for name in sorted(set(expected) | set(actual)):
+        if name not in actual:
+            die(f"{package}: artifact is missing {name} (expected from {origin})")
+        if name not in expected:
+            die(f"{package}: artifact adds {name}, which {origin} does not have")
+        want, got = expected[name], actual[name]
+        for pos in range(max(len(want), len(got))):
+            if pos >= len(got):
+                die(f"{package}: {name}[{pos}] is missing; {origin} has {want[pos]!r}")
+            if pos >= len(want):
+                die(f"{package}: {name}[{pos}] {got[pos]!r} is extra; {origin} has {len(want)} items")
+            if want[pos] != got[pos]:
+                die(f"{package}: {name}[{pos}] is {got[pos]!r}, {origin} has {want[pos]!r}")
+
+
+def decode_expected_sources(package: str, raw: str | None) -> dict[str, list[str]]:
+    if not raw:
+        die(f"{package}: missing host-computed --expected-sources; refusing to import")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        die(f"{package}: invalid --expected-sources: {exc}")
+    if not isinstance(data, dict) or not data or not all(
+        isinstance(k, str) and re.fullmatch(r"source(?:_[A-Za-z0-9_]+)?", k)
+        and isinstance(v, list) and all(isinstance(i, str) for i in v)
+        for k, v in data.items()
+    ):
+        die(f"{package}: invalid --expected-sources")
+    return data
+
+
+def assert_baseline_version(package: str, baseline: str, candidate: str) -> None:
+    """stage / check-pkgbuild: the build may not choose its own version.
+
+    The baseline is the PKGBUILD update_package.py wrote on the host in this
+    run. Non -git packages must keep its pkgver and pkgrel exactly (makepkg
+    has no pkgver() for them). -git packages keep pkgrel exactly; their pkgver
+    may only grow the hash (same_pkgver_commit, checked in the delta).
+    """
+    base_ver, base_rel = read_var(baseline, "pkgver"), read_var(baseline, "pkgrel")
+    cand_ver, cand_rel = read_var(candidate, "pkgver"), read_var(candidate, "pkgrel")
+    if not package.endswith("-git") and cand_ver != base_ver:
+        die(f"{package}: build changed pkgver from the host value {base_ver} to {cand_ver}")
+    if cand_rel != base_rel:
+        die(f"{package}: build changed pkgrel from the host value {base_rel} to {cand_rel}")
+
+
+def assert_pkgrel_rule(package: str, current: str, updated: str) -> None:
+    """import: pkgrel follows the updater, never the artifact.
+
+    Same pkgver as main -> main's pkgrel; new pkgver -> 1. A manual pkgrel
+    bump has to land on main through a PR. memprocfs is the exception: its
+    pkgrel is the upstream asset date, which assert_host_pkgver already pins
+    to the host-computed value. For -git packages "same pkgver" means the
+    same commit (the abbreviated hash may grow).
+    """
+    if package == "memprocfs":
+        return
+    old_ver, old_rel = read_var(current, "pkgver"), read_var(current, "pkgrel")
+    new_ver, new_rel = read_var(updated, "pkgver"), read_var(updated, "pkgrel")
+    if package.endswith("-git"):
+        same = same_pkgver_commit(old_ver, new_ver)
+    else:
+        same = old_ver == new_ver
+    want = old_rel if same else "1"
+    if new_rel != want:
+        if same:
+            reason = f"pkgver {new_ver} is unchanged, so pkgrel must stay main's {old_rel}"
+        else:
+            reason = f"pkgver changed {old_ver} -> {new_ver}, so pkgrel must be 1"
+        die(f"{package}: artifact pkgrel {new_rel} refused: {reason}; bump pkgrel on main through a PR")
+
+
 def assert_not_downgrade(package: str, current: str, updated: str) -> None:
     old_ver = read_var(current, "pkgver")
     old_rel = read_var(current, "pkgrel")
@@ -269,6 +422,7 @@ def check_pkgbuild(
         read_text_file(candidate),
         allow_source=False,
     )
+    assert_baseline_version(package, read_text_file(baseline), read_text_file(candidate))
     if old_version_file is None:
         return
     old = read_text_file(old_version_file).strip()
@@ -292,6 +446,7 @@ def stage(package: str, baseline: Path, build_out: Path, stage_dir: Path) -> Non
         pkg_bytes.decode("utf-8"),
         allow_source=False,
     )
+    assert_baseline_version(package, read_text_file(baseline), pkg_bytes.decode("utf-8"))
     empty_dir(stage_dir)
     target = stage_dir / "PKGBUILD"
     target.write_bytes(pkg_bytes)
@@ -328,19 +483,23 @@ def assert_host_pkgver(
     updated: str,
     expected_pkgver: str | None,
     expected_commit: str | None,
+    expected_pkgrel: str | None = None,
 ) -> None:
     """Require the sealed pkgver to equal the pkgver the publish host computed.
 
     import masks pkgver when it compares PKGBUILDs, and vercmp alone cannot
     tell two hashes of the same rN apart or stop a huge rN that would block
     every later update. For -git packages the publish job recomputes the
-    pkgver from upstream (publish_artifact.py expect) and passes it in here;
-    a missing value fails closed. Other packages are unchanged unless a value
-    is passed.
+    pkgver from upstream (publish_artifact.py expect) and passes it in here.
+    For the release packages (maple-mono-nf-cn, memprocfs, moonbit-bin) it
+    recomputes pkgver and pkgrel (publish_artifact.py expect-release) and
+    both must match exactly. A missing value fails closed for all of them.
+    Other packages are unchanged unless a value is passed.
     """
     is_git = package.endswith("-git")
+    is_release = package in update_package.RELEASE_PACKAGES
     if not expected_pkgver:
-        if is_git:
+        if is_git or is_release:
             die(f"{package}: missing host-computed --expected-pkgver; refusing to import")
         return
     if not update_package.PKGVER_RE.fullmatch(expected_pkgver):
@@ -351,6 +510,16 @@ def assert_host_pkgver(
             f"{package}: artifact pkgver {actual} does not match the host-computed "
             f"pkgver {expected_pkgver}"
         )
+    if is_release:
+        if not expected_pkgrel or not update_package.PKGREL_RE.fullmatch(expected_pkgrel):
+            die(f"{package}: missing or invalid host-computed --expected-pkgrel; refusing to import")
+        actual_rel = read_var(updated, "pkgrel")
+        if actual_rel != expected_pkgrel:
+            die(
+                f"{package}: artifact pkgrel {actual_rel} does not match the host-computed "
+                f"pkgrel {expected_pkgrel}"
+            )
+        return
     if not is_git:
         return
     if not expected_commit or not re.fullmatch(r"[0-9a-f]{40}", expected_commit):
@@ -409,12 +578,43 @@ def expect(package: str, artifact: Path) -> None:
     set_output("commit", commit)
 
 
+def expect_release(package: str, artifact: Path, main_pkgbuild: Path) -> None:
+    """Compute the expected pkgver and pkgrel of a release package on the host.
+
+    Runs the updater's version logic read-only (update_package.expected_release)
+    against the PKGBUILD on main. The artifact is only read to see whether it is
+    a skip marker, in which case nothing is downloaded and both outputs are
+    empty. Writes the outputs pkgver and pkgrel.
+    """
+    validate_package(package)
+    if package not in update_package.RELEASE_PACKAGES:
+        die(f"{package} is not a release package")
+    pkg_bytes = read_artifact(package, artifact)
+    if pkg_bytes is None:
+        set_output("pkgver", "")
+        set_output("pkgrel", "")
+        set_output("sources", "")
+        return
+    main_text = read_text_file(main_pkgbuild)
+    if read_var(main_text, "pkgname") != package:
+        die(f"{main_pkgbuild} is not the PKGBUILD of {package}")
+    pkgver, pkgrel, expected_text = update_package.expected_release_pkgbuild(package, main_text)
+    sources = parse_sources(package, expected_text)
+    if not sources:
+        die(f"{package}: the expected PKGBUILD has no source array")
+    set_output("pkgver", pkgver)
+    set_output("pkgrel", pkgrel)
+    set_output("sources", json.dumps(sources, separators=(",", ":"), sort_keys=True))
+
+
 def import_artifact(
     package: str,
     artifact: Path,
     dest: Path,
     expected_pkgver: str | None = None,
     expected_commit: str | None = None,
+    expected_pkgrel: str | None = None,
+    expected_sources: str | None = None,
 ) -> None:
     validate_package(package)
     if dest.is_symlink() or not dest.is_dir():
@@ -431,8 +631,18 @@ def import_artifact(
     if current_path.is_symlink() or not current_path.is_file():
         die("checkout PKGBUILD must be a regular file")
     current = read_text_file(current_path)
+    assert_host_pkgver(package, pkgbuild, expected_pkgver, expected_commit, expected_pkgrel)
+    # Lock the source arrays. -git: exactly main's. Release packages: exactly
+    # what the host-side updater produced. Parsed only, never evaluated.
+    if package.endswith("-git"):
+        assert_sources(package, parse_sources(package, current), pkgbuild, "main")
+    elif package in update_package.RELEASE_PACKAGES:
+        assert_sources(
+            package, decode_expected_sources(package, expected_sources), pkgbuild, "the host"
+        )
     assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True, require_same_git_commit=False)
-    assert_host_pkgver(package, pkgbuild, expected_pkgver, expected_commit)
+    if package.endswith("-git") or package in update_package.RELEASE_PACKAGES:
+        assert_pkgrel_rule(package, current, pkgbuild)
     assert_not_downgrade(package, current, pkgbuild)
     write_into(dest, "PKGBUILD", pkg_bytes)
     set_output("publish", "true")
@@ -463,10 +673,17 @@ def main(argv: list[str]) -> int:
     import_cmd.add_argument("--dest", required=True, type=Path)
     import_cmd.add_argument("--expected-pkgver", default="")
     import_cmd.add_argument("--expected-commit", default="")
+    import_cmd.add_argument("--expected-pkgrel", default="")
+    import_cmd.add_argument("--expected-sources", default="")
 
     expect_cmd = sub.add_parser("expect")
     expect_cmd.add_argument("--package", required=True)
     expect_cmd.add_argument("--artifact", required=True, type=Path)
+
+    release_cmd = sub.add_parser("expect-release")
+    release_cmd.add_argument("--package", required=True)
+    release_cmd.add_argument("--artifact", required=True, type=Path)
+    release_cmd.add_argument("--main-pkgbuild", required=True, type=Path)
 
     args = parser.parse_args(argv[1:])
     if args.cmd == "check-pkgbuild":
@@ -480,6 +697,8 @@ def main(argv: list[str]) -> int:
         stage_skip(args.stage)
     elif args.cmd == "expect":
         expect(args.package, args.artifact)
+    elif args.cmd == "expect-release":
+        expect_release(args.package, args.artifact, args.main_pkgbuild)
     else:
         import_artifact(
             args.package,
@@ -487,6 +706,8 @@ def main(argv: list[str]) -> int:
             args.dest,
             args.expected_pkgver or None,
             args.expected_commit or None,
+            args.expected_pkgrel or None,
+            args.expected_sources or None,
         )
     return 0
 

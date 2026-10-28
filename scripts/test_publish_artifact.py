@@ -27,6 +27,13 @@ sha256sums=('{H1}'
 """
 
 
+def sources_of(pkgbuild: str) -> str:
+    """The --expected-sources value an honest host would compute."""
+    import json
+
+    return json.dumps(gate.parse_sources("test", pkgbuild))
+
+
 def write_pkgbuild(directory: Path, pkgbuild: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "PKGBUILD").write_text(pkgbuild, encoding="utf-8")
@@ -53,10 +60,19 @@ class StageTest(unittest.TestCase):
             self.assertIn(f"pkgbuild={digest}", manifest)
             self.assertEqual(sorted(path.name for path in stage.iterdir()), ["MANIFEST", "PKGBUILD"])
 
-    def test_pkgver_and_pkgrel_edits_are_accepted(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            updated = BASELINE.replace("pkgver=7.9", "pkgver=7.10").replace("pkgrel=1", "pkgrel=2")
-            self.stage(Path(tmp), updated)
+    def test_build_cannot_change_pkgver_or_pkgrel(self) -> None:
+        # Was "pkgver and pkgrel edits are accepted": the build container
+        # could pick any version (Quinn: moonbit pkgver=99999 passed).
+        cases = (
+            (BASELINE.replace("pkgver=7.9", "pkgver=7.10").replace("pkgrel=1", "pkgrel=2"), "pkgver"),
+            (BASELINE.replace("pkgver=7.9", "pkgver=99999"), "pkgver from the host value 7.9 to 99999"),
+            (BASELINE.replace("pkgrel=1", "pkgrel=99999"), "pkgrel from the host value 1 to 99999"),
+        )
+        for updated, needle in cases:
+            with self.subTest(needle=needle), tempfile.TemporaryDirectory() as tmp:
+                with self.assertRaises(SystemExit) as caught:
+                    self.stage(Path(tmp), updated)
+                self.assertIn(needle, str(caught.exception))
 
     def test_source_url_edit_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -158,7 +174,7 @@ class ImportTest(unittest.TestCase):
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
             (dest / ".SRCINFO").write_text("old\n", encoding="utf-8")
             (dest / "extra.txt").write_text("keep\n", encoding="utf-8")
-            gate.import_artifact("maple-mono-nf-cn", stage, dest)
+            gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE))
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), updated)
             self.assertEqual((dest / ".SRCINFO").read_text(encoding="utf-8"), "old\n")
             self.assertEqual((dest / "extra.txt").read_text(encoding="utf-8"), "keep\n")
@@ -172,7 +188,7 @@ class ImportTest(unittest.TestCase):
             current = BASELINE.replace("pkgver=7.9", "pkgver=8.0")
             (dest / "PKGBUILD").write_text(current, encoding="utf-8")
             with self.assertRaises(SystemExit) as caught:
-                gate.import_artifact("maple-mono-nf-cn", stage, dest)
+                gate.import_artifact("maple-mono-nf-cn", stage, dest, "7.9", None, "1", sources_of(BASELINE))
             self.assertIn("older", str(caught.exception))
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), current)
 
@@ -191,7 +207,7 @@ class ImportTest(unittest.TestCase):
             dest = root / "memprocfs"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(old, encoding="utf-8")
-            gate.import_artifact("memprocfs", artifact, dest)
+            gate.import_artifact("memprocfs", artifact, dest, "5.19.0", None, "20261101", sources_of(new))
             self.assertIn("new.tar.gz", (dest / "PKGBUILD").read_text(encoding="utf-8"))
 
     def test_import_rejects_shell_in_source_and_srcinfo_payload(self) -> None:
@@ -399,20 +415,119 @@ class ImportTest(unittest.TestCase):
             gate.import_artifact("reflectcpp-git", stage, dest)
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), self.REFLECTCPP_R10)
 
-    def test_non_git_import_is_unchanged_without_expected_pkgver(self) -> None:
-        # moonbit-bin schedule / force: no expect step, no expected value.
-        old = "pkgname=moonbit-bin\npkgver=0.1.20261023\npkgrel=2\n" f"sha256sums=('{H1}')\n"
-        for new in (old.replace("20261023", "20261101").replace("pkgrel=2", "pkgrel=1").replace(H1, H3), old):
-            with self.subTest(new=new.splitlines()[1]), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                artifact = root / "artifact"
-                write_pkgbuild(artifact, new)
-                gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
-                dest = root / "moonbit-bin"
-                dest.mkdir()
-                (dest / "PKGBUILD").write_text(old, encoding="utf-8")
-                gate.import_artifact("moonbit-bin", artifact, dest)
+    MOONBIT = (
+        "pkgname=moonbit-bin\npkgver=0.1.20261023\npkgrel=2\n"
+        'source=("https://cli.moonbitlang.cn/binaries/latest/moonbit-linux-x86_64.tar.gz#filename=${pkgname}-${pkgver}-linux-x86_64.tar.gz"\n'
+        '  "https://cli.moonbitlang.cn/cores/core-latest.tar.gz#filename=moonbit-core-${pkgver}.tar.gz"\n'
+        '  "moon.sh")\n'
+        f"sha256sums=('{H1}')\n"
+    )
+
+    def import_release(self, current: str, updated: str, *expected) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        artifact = root / "artifact"
+        write_pkgbuild(artifact, updated)
+        gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+        package = gate.read_var(current, "pkgname")
+        dest = root / package
+        dest.mkdir()
+        (dest / "PKGBUILD").write_text(current, encoding="utf-8")
+        self.dest = dest
+        if len(expected) == 3:
+            expected = (*expected, sources_of(updated))
+        gate.import_artifact(package, artifact, dest, *expected)
+        return dest
+
+    def test_release_import_without_expected_values_fails_closed(self) -> None:
+        # Replaces the old "non-git import is unchanged without expected
+        # pkgver" case: release packages now require host values too.
+        old = self.MOONBIT
+        bumped = old.replace("20261023", "20261101").replace("pkgrel=2", "pkgrel=1").replace(H1, H3)
+        for new in (bumped, old):
+            for expected in ((), (None, None, None), ("", "", "")):
+                with self.subTest(new=new.splitlines()[1], expected=expected):
+                    with self.assertRaises(SystemExit) as caught:
+                        self.import_release(old, new, *expected)
+                    self.assertIn("missing host-computed --expected-pkgver", str(caught.exception))
+                    self.assertEqual((self.dest / "PKGBUILD").read_text(encoding="utf-8"), old)
+
+    def test_release_import_requires_expected_pkgrel(self) -> None:
+        for rel in (None, "", "x", "1;id"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(SystemExit) as caught:
+                    self.import_release(self.MOONBIT, self.MOONBIT, "0.1.20261023", None, rel)
+                self.assertIn("expected-pkgrel", str(caught.exception))
+
+    def test_release_import_exact_match_is_accepted(self) -> None:
+        bumped = self.MOONBIT.replace("20261023", "20261101").replace("pkgrel=2", "pkgrel=1").replace(H1, H3)
+        for new, ver, rel in ((bumped, "0.1.20261101", "1"), (self.MOONBIT, "0.1.20261023", "2")):
+            with self.subTest(ver=ver, rel=rel):
+                dest = self.import_release(self.MOONBIT, new, ver, None, rel)
                 self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), new)
+
+    def test_release_import_rejects_pkgver_or_pkgrel_mismatch(self) -> None:
+        bumped = self.MOONBIT.replace("20261023", "20261101").replace("pkgrel=2", "pkgrel=1").replace(H1, H3)
+        cases = (
+            # artifact claims a newer upstream than the host sees
+            (bumped, "0.1.20261023", "2", "does not match the host-computed pkgver"),
+            # repo-only pkgrel bump the host does not know about
+            (self.MOONBIT.replace("pkgrel=2", "pkgrel=3"), "0.1.20261023", "2", "pkgrel 3 does not match"),
+            # huge pkgrel that would block later updates
+            (self.MOONBIT.replace("pkgrel=2", "pkgrel=999"), "0.1.20261023", "2", "pkgrel 999 does not match"),
+            (bumped, "0.1.20261101", "2", "pkgrel 1 does not match"),
+        )
+        for new, ver, rel, needle in cases:
+            with self.subTest(needle=needle):
+                with self.assertRaises(SystemExit) as caught:
+                    self.import_release(self.MOONBIT, new, ver, None, rel)
+                self.assertIn(needle, str(caught.exception))
+                self.assertEqual((self.dest / "PKGBUILD").read_text(encoding="utf-8"), self.MOONBIT)
+
+    def test_release_import_still_refuses_a_downgrade(self) -> None:
+        older = self.MOONBIT.replace("20261023", "20261001").replace("pkgrel=2", "pkgrel=1")
+        with self.assertRaises(SystemExit) as caught:
+            self.import_release(self.MOONBIT, older, "0.1.20261001", None, "1")
+        self.assertIn("older", str(caught.exception))
+
+    def test_release_skip_artifact_needs_no_expected_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage = root / "stage"
+            gate.stage_skip(stage)
+            dest = root / "moonbit-bin"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(self.MOONBIT, encoding="utf-8")
+            gate.import_artifact("moonbit-bin", stage, dest)
+            self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), self.MOONBIT)
+
+    def test_unlisted_non_git_package_is_unchanged_without_expected_pkgver(self) -> None:
+        old = "pkgname=asus-fa401km-acpi-fix\npkgver=1.0.0\npkgrel=1\n" f"sha256sums=('{H1}')\n"
+        new = old.replace("pkgrel=1", "pkgrel=2").replace(H1, H3)
+        dest = self.import_release(old, new)
+        self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), new)
+
+    def test_cli_passes_expected_pkgrel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            write_pkgbuild(artifact, self.MOONBIT)
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+            dest = root / "moonbit-bin"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(self.MOONBIT, encoding="utf-8")
+            argv = ["publish_artifact.py", "import", "--package", "moonbit-bin",
+                    "--artifact", str(artifact), "--dest", str(dest),
+                    "--expected-pkgver", "0.1.20261023", "--expected-commit", "",
+                    "--expected-sources", sources_of(self.MOONBIT)]
+            with self.assertRaises(SystemExit) as caught:
+                gate.main(argv + ["--expected-pkgrel", "1"])
+            self.assertIn("pkgrel 2 does not match", str(caught.exception))
+            out = root / "out"
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}):
+                gate.main(argv + ["--expected-pkgrel", "2"])
+            self.assertIn("publish=true", out.read_text(encoding="utf-8"))
 
 
 class ExpectTest(unittest.TestCase):
@@ -536,7 +651,7 @@ class GitCommitPkgverTest(unittest.TestCase):
             dest = root / "maple-mono-nf-cn"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
-            gate.import_artifact("maple-mono-nf-cn", nested, dest)
+            gate.import_artifact("maple-mono-nf-cn", nested, dest, "7.9", None, "1", sources_of(BASELINE))
             self.assertFalse((dest / ".SRCINFO").exists())
 
     def test_manifest_hash_mismatch_is_rejected(self) -> None:
