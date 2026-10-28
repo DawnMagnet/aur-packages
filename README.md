@@ -1,6 +1,6 @@
 # aur-packages
 
-PKGBUILDs for [DawnMagnet](https://aur.archlinux.org/packages?K=DawnMagnet&SeB=m)'s AUR packages. GitHub Actions checks upstream every 2 days, test-builds in `archlinux:base-devel`, and publishes only when that build succeeds.
+PKGBUILDs for [DawnMagnet](https://aur.archlinux.org/packages?K=DawnMagnet&SeB=m)'s AUR packages. GitHub Actions checks upstream every 2 days, test-builds in `archlinux:base-devel`, and publishes from a separate job only when that build succeeds.
 
 | Package | Kind | Upstream | Automation |
 | --- | --- | --- | --- |
@@ -20,17 +20,29 @@ The hearthstone directories are disabled with `.aur-disabled` and are absent fro
 `.github/workflows/update-aur.yml` runs:
 
 - on the schedule `0 0 */2 * *` (00:00 UTC on odd days of the month; GitHub may start the job late)
-- on `workflow_dispatch`
+- on `workflow_dispatch`, with boolean input `force_publish` (default false)
 - on a push to `main` that touches a package directory, `nvchecker.toml`, `scripts/`, or the workflow file
 
-Each package is its own matrix job (`fail-fast: false`), so one failure does not cancel the others. A job checks out the latest `main`, then:
+`force_publish` exists only on manual runs. When it is true, every matrix package is test-built and published even if the upstream version did not change. Schedule and push runs cannot set it. Dispatch it from `main`.
 
-1. `scripts/update_package.py` compares upstream with the PKGBUILD. `nvchecker.toml` is the version source for GitHub releases. The script also calls `nvchecker` when it is installed (CI installs it) and uses `GITHUB_TOKEN` via a gitignored `nvchecker-keyfile.toml`.
-2. If the upstream version is strictly newer (`vercmp`), it sets `pkgver`, resets `pkgrel` to `1` (memprocfs uses the asset date as `pkgrel`; see below), and updates source URLs.
-3. `scripts/test_build.sh` runs `archlinux:base-devel` and `scripts/build_in_arch.sh` as the unprivileged user `builder`: `updpkgsums`, `makepkg --printsrcinfo`, `makepkg -s`, then `namcap` (its findings are ignored). VCS packages run `makepkg --nobuild --nodeps` first so `pkgver()` is what gets published. The build is x86_64 only; aarch64 checksums are still generated for packages that ship them.
-4. Only after that build passes, `scripts/publish.sh` pushes the package directory to `ssh://aur@aur.archlinux.org/<name>.git` branch `master`, then commits `Update to <pkgver>-<pkgrel>` here as `DawnMagnet <DawnMagnet@users.noreply.github.com>`.
+Each package is its own matrix entry (`fail-fast: false`). Build and publish are separate jobs and share a per-package concurrency group (`aur-update-<package>`, `cancel-in-progress: false`).
 
-A failing build does not push to the AUR or to this repo. The next run retries from the last commit. Pushes are normal fast-forwards: the script does not force-push and does not rewrite AUR history. Jobs for the same package are serialized. Commits back to this repo use `GITHUB_TOKEN`, which does not start another workflow run.
+### Build job
+
+Permissions are `contents: read` and `actions: write` (upload the artifact only). The job does not receive `AUR_SSH_PRIVATE_KEY`. Checkout uses `persist-credentials: false`, so the job token is not written into `.git/config`.
+
+1. `scripts/update_package.py` compares upstream with the PKGBUILD. `nvchecker.toml` is the version source for GitHub releases. The script also calls `nvchecker` when it is installed (CI installs it) and uses `GITHUB_TOKEN` via a gitignored `nvchecker-keyfile.toml`. That file stays in the checkout root and is not mounted into the container.
+2. If the upstream version is strictly newer (`vercmp`), it sets `pkgver`, resets `pkgrel` to `1` (memprocfs uses the asset date as `pkgrel`; see below), and updates source URLs. When nothing changed and this is not a manual `force_publish`, the job uploads a skip marker and does not start Docker.
+3. `scripts/test_build.sh` runs `archlinux:base-devel`. The package directory is mounted read-only at `/pkg`. A temporary directory is mounted at `/work`. `scripts/build_in_arch.sh` is mounted read-only; the git checkout, the other packages, and `scripts/publish.sh` are not visible in the container. The script copies the package into `/work` and runs as the unprivileged user `builder`: `updpkgsums`, `makepkg --printsrcinfo`, `makepkg -s`, then `namcap` (its findings are ignored). VCS packages run `makepkg --nobuild --nodeps` first so `pkgver()` is what gets published. The build is x86_64 only; aarch64 checksums are still generated for packages that ship them.
+4. The runner keeps the result only when `PKGBUILD` differs from the updater's file by checksums (a `-git` package may also change the abbreviated hash in `pkgver`) and `.SRCINFO` matches. Those two text files, plus a manifest of their hashes, are the artifact. The build workspace is discarded.
+
+### Publish job
+
+`needs: build`. A failed build of one package does not cancel the others. This job's permissions are `contents: write` and `actions: read`. It is the only job that runs in the `aur` environment and the only job that is given `AUR_SSH_PRIVATE_KEY`. It checks out `main` again (`persist-credentials: true`, so the commit can be pushed) and does not reuse the build workspace or any script the build could have edited.
+
+The artifact is checked again (regular files, size, UTF-8, `pkgname`, `.SRCINFO`, no `SKIP` checksums on non-`-git` packages, no downgrade against the clean tree). The two files are copied onto that tree. `scripts/publish.sh` then pushes the package directory to `ssh://aur@aur.archlinux.org/<name>.git` branch `master`, then commits `Update to <pkgver>-<pkgrel>` here as `DawnMagnet <DawnMagnet@users.noreply.github.com>`.
+
+A failing build does not push to the AUR or to this repo. The next run retries from the last commit. Pushes are normal fast-forwards: the script does not force-push and does not rewrite AUR history. Commits back to this repo use `GITHUB_TOKEN`, which does not start another workflow run.
 
 Host keys for `aur.archlinux.org` are pinned in `scripts/aur_known_hosts` and checked against the fingerprints published on the AUR homepage:
 
@@ -44,8 +56,12 @@ The publish step also runs `ssh-keyscan` and refuses to connect if the live key 
 
 | Secret | Use |
 | --- | --- |
-| `AUR_SSH_PRIVATE_KEY` | ed25519 private key whose public key is registered on the DawnMagnet AUR account |
-| `GITHUB_TOKEN` | automatic; GitHub API for nvchecker and pushing commits back to `main` |
+| `AUR_SSH_PRIVATE_KEY` | ed25519 private key whose public key is registered on the DawnMagnet AUR account. Store it on the `aur` environment (below), not as a repository secret, so only the publish job can read it. |
+| `GITHUB_TOKEN` | automatic. The build job's token is read-only and is used for the GitHub API. The publish job's token can push to `main`. |
+
+### `aur` environment
+
+The publish job sets `environment: aur`. Create that environment in the repository settings before relying on the branch restriction: deployment branches limited to `main`, and `AUR_SSH_PRIVATE_KEY` added there. If the environment does not exist, GitHub creates it on the first run with no branch rule and no secrets; a repository-level copy of the key still works until it is removed. After one successful publish on this workflow, delete the repository-level secret so other jobs cannot use it.
 
 ## Version schemes
 
@@ -64,7 +80,7 @@ The install script accepts `.../binaries/<version>/moonbit-linux-x86_64.tar.gz` 
 
 The updater downloads `latest`, runs `moon version` with `PATH`, `MOONC_OVERRIDE`, and `MOONRUN_OVERRIDE` pointed at the bundled tools (upstream ships them mode 0644), and records that version (`0.1.20261023` as of this writing; `moonc` reports its own version, currently `v0.10.17`). `updpkgsums` pins the checksum of that tarball and of `core-latest.tar.gz`. Nothing is mirrored.
 
-An already published PKGBUILD breaks when `latest` moves, because the checksum no longer matches. That is unavoidable without versioned URLs. The 6 hour schedule replaces the pin. The build also checks that `moon version` from the tarball that `makepkg` verified still equals `pkgver`.
+An already published PKGBUILD breaks when `latest` moves, because the checksum no longer matches. That is unavoidable without versioned URLs. The scheduled run replaces the pin. The build also checks that `moon version` from the tarball that `makepkg` verified still equals `pkgver`.
 
 ### VCS packages
 
@@ -77,8 +93,8 @@ An already published PKGBUILD breaks when `latest` moves, because the checksum n
 1. Create `<name>/` with a `PKGBUILD`, `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`), and any extra sources (`install` scripts, wrappers).
 2. Add an entry to `nvchecker.toml`. Use `source = "github"` for tags and releases. Use `source = "cmd"` when the version has to be read from an asset name or a binary, and point it at a small script under `scripts/`.
 3. Teach `scripts/update_package.py` how to rewrite that PKGBUILD, and add the name to the allowlist in `scripts/publish.sh`.
-4. Add a matrix row in `.github/workflows/update-aur.yml`, including the directory in the `push` path filter.
-5. Push to `main`. The workflow builds and, on success, pushes to the AUR.
+4. Add the same matrix row to the build job and the publish job in `.github/workflows/update-aur.yml`, and include the directory in the `push` path filter.
+5. Push to `main`. The workflow builds and, on success, the publish job pushes to the AUR.
 
 To stage a package without publishing it, commit the directory with a `.aur-disabled` file and leave it out of the matrix and the publish allowlist. That is how `hearthstone-linux-gui-bin` and `hearthstone-linux-gui-appimage` are stored. For those two, upstream releases already include `hearthstone-linux-gui-<ver>-<rel>-x86_64.pkg.tar.zst` and `hearthstone-linux-gui-<ver>-x86_64.AppImage` plus `SHA256SUMS.txt`.
 

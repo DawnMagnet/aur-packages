@@ -2,9 +2,11 @@
 """Update one package directory to the current upstream version.
 
 The script reads nvchecker.toml for GitHub coordinates, then rewrites pkgver,
-pkgrel, and (for memprocfs) source URLs. Checksums for non-VCS packages are
-filled afterwards by updpkgsums inside the Arch test build. A package is left
-untouched when the upstream version is not strictly newer.
+pkgrel, and (for memprocfs) source URLs. A pkgver bump resets pkgrel to 1.
+memprocfs does not: its pkgrel is the upstream asset date. Checksums for
+non-VCS packages are filled afterwards by updpkgsums inside the Arch test
+build. A package is left untouched when the upstream version is not strictly
+newer.
 """
 
 from __future__ import annotations
@@ -206,6 +208,16 @@ def set_quoted_array(text: str, name: str, url: str) -> str:
     return new
 
 
+def bump_pkgver(text: str, new_ver: str) -> str:
+    """Set pkgver and reset pkgrel to 1.
+
+    memprocfs does not use this helper. Its pkgrel is the upstream asset date.
+    """
+    text = set_var(text, "pkgver", new_ver)
+    text = set_var(text, "pkgrel", "1")
+    return text
+
+
 def full_version(pkgver: str, pkgrel: str) -> str:
     return f"{pkgver}-{pkgrel}"
 
@@ -245,8 +257,7 @@ def update_maple() -> None:
         mark_unchanged("maple-mono-nf-cn", old_full)
         return
     require_newer("maple-mono-nf-cn", old_full, new_full)
-    text = set_var(text, "pkgver", new_ver)
-    text = set_var(text, "pkgrel", "1")
+    text = bump_pkgver(text, new_ver)
     write_pkgbuild("maple-mono-nf-cn", text)
     mark_changed("maple-mono-nf-cn", old_full, new_full)
 
@@ -367,8 +378,7 @@ def update_moonbit() -> None:
         return
     new_full = full_version(new_ver, "1")
     require_newer("moonbit-bin", old_full, new_full)
-    text = set_var(text, "pkgver", new_ver)
-    text = set_var(text, "pkgrel", "1")
+    text = bump_pkgver(text, new_ver)
     write_pkgbuild("moonbit-bin", text)
     mark_changed("moonbit-bin", old_full, new_full)
 
@@ -412,6 +422,25 @@ def same_commit(old_ver: str, head: str) -> bool:
     return bool(match) and head.startswith(match.group(1))
 
 
+def same_pkgver_commit(left: str, right: str) -> bool:
+    """True when two git pkgver strings describe the same commit.
+
+    The abbreviated hash may grow from 7 hex digits to 8 without the commit
+    changing. The tag and revision prefix must still match.
+    """
+    if left == right:
+        return True
+    left_match = GIT_HASH_RE.search(left)
+    right_match = GIT_HASH_RE.search(right)
+    if not left_match or not right_match:
+        return False
+    if left[: left_match.start()] != right[: right_match.start()]:
+        return False
+    left_hash = left_match.group(1)
+    right_hash = right_match.group(1)
+    return left_hash.startswith(right_hash) or right_hash.startswith(left_hash)
+
+
 def update_git(pkg: str, url: str) -> None:
     nvchecker_version(pkg)
     new_ver, head = git_pkgver(url, ["--long", "--tags"])
@@ -424,8 +453,7 @@ def update_git(pkg: str, url: str) -> None:
         mark_unchanged(pkg, old_full)
         return
     require_newer(pkg, old_full, new_full)
-    text = set_var(text, "pkgver", new_ver)
-    text = set_var(text, "pkgrel", "1")
+    text = bump_pkgver(text, new_ver)
     write_pkgbuild(pkg, text)
     mark_changed(pkg, old_full, new_full)
 
@@ -445,7 +473,29 @@ UPDATERS = {
 }
 
 
+def self_check() -> None:
+    """Offline checks for the pkgrel reset and git commit comparison."""
+    sample = "pkgname=example\npkgver=1.0.0\npkgrel=4\n"
+    bumped = bump_pkgver(sample, "1.2.0")
+    if read_var(bumped, "pkgver") != "1.2.0" or read_var(bumped, "pkgrel") != "1":
+        raise SystemExit("self-check: pkgrel was not reset to 1 on pkgver bump")
+    if read_var(sample, "pkgrel") != "4":
+        raise SystemExit("self-check: bump_pkgver mutated its input")
+    if not same_commit("0.8.2.r0.gc2f2a2b", "c2f2a2b1234567890"):
+        raise SystemExit("self-check: same_commit missed a full hash")
+    if same_commit("0.8.2.r0.gc2f2a2b", "deadbeef1234567890"):
+        raise SystemExit("self-check: same_commit matched a different commit")
+    if not same_pkgver_commit("0.8.2.r0.gc2f2a2b", "0.8.2.r0.gc2f2a2b1"):
+        raise SystemExit("self-check: abbreviated git pkgvers of one commit differed")
+    if same_pkgver_commit("0.8.2.r0.gabcdef1", "0.8.2.r1.gabcdef12"):
+        raise SystemExit("self-check: different git revisions compared equal")
+    print("self-check ok")
+
+
 def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[1] == "--self-check":
+        self_check()
+        return 0
     if len(argv) != 2:
         print(f"usage: {argv[0]} <package>", file=sys.stderr)
         return 2
