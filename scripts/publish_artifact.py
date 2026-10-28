@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Move PKGBUILD and .SRCINFO from a build job to a clean publish checkout.
+"""Pass a sealed PKGBUILD from the build job to a clean publish checkout.
 
-The build container can rewrite its work directory. This script is the gate
-that runs on the trusted runner:
-
-* stage compares the container output with the PKGBUILD produced by
-  update_package.py and keeps checksum edits (git packages may also change
-  the abbreviated commit in pkgver).
-* import checks the manifest, file types, pkgname, .SRCINFO, SKIP policy,
-  and refuses a downgrade against the clean checkout.
+The test build runs in a second container that cannot see this file. The
+publish job does not accept a .SRCINFO from the build; it regenerates one
+with makepkg --printsrcinfo from the validated PKGBUILD.
 """
 
 from __future__ import annotations
@@ -25,12 +20,25 @@ from update_package import read_var, same_pkgver_commit, set_output
 
 MAX_BYTES = 256 * 1024
 PKG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-SUM_RE = re.compile(
-    r"^(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_[A-Za-z0-9_]+)?\+?="
+ASSIGN_RE = re.compile(r"^(pkgver|pkgrel)=([A-Za-z0-9._+]+)$")
+SUM_START_RE = re.compile(
+    r"^(?P<algo>md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[A-Za-z0-9_]+)?=\("
 )
-SKIP_RE = re.compile(r"sums(_[A-Za-z0-9_]+)?=\(.*SKIP", re.S)
-SRCINFO_SKIP_RE = re.compile(r"(?m)^[ \t]*[A-Za-z0-9_]*sums.*\bSKIP\b")
-HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+SUM_INSIDE_RE = re.compile(r"\A(?:\s*'(?:[0-9a-f]+|SKIP)'\s*,?\s*)+\Z")
+# Single-line source arrays the updater rewrites (memprocfs). Multi-line
+# source arrays must be unchanged; they are not masked.
+SOURCE_RE = re.compile(
+    r'^source(?:_[A-Za-z0-9_]+)?=\("https://[A-Za-z0-9._~:/?#@%+=-]{1,2000}"\)$'
+)
+HASH_LEN = {
+    "md5": 32,
+    "sha1": 40,
+    "sha224": 56,
+    "sha256": 64,
+    "sha384": 96,
+    "sha512": 128,
+    "b2": 128,
+}
 
 
 def die(msg: str) -> None:
@@ -61,8 +69,7 @@ def read_text_file(path: Path) -> str:
 
 
 def read_bytes(path: Path) -> bytes:
-    text = read_text_file(path)
-    return text.encode("utf-8")
+    return read_text_file(path).encode("utf-8")
 
 
 def list_files(directory: Path) -> list[str]:
@@ -94,82 +101,96 @@ def locate_artifact(artifact: Path) -> Path:
     die("unrecognized artifact layout")
 
 
-def strip_pkgbuild(text: str, *, drop_pkgver: bool) -> str:
-    lines = text.splitlines(keepends=True)
+def consume_sum_block(lines: list[str], start: int) -> tuple[re.Match[str], str, int]:
+    match = SUM_START_RE.match(lines[start])
+    if match is None:
+        die("internal error: not a checksum line")
+    inside = lines[start].split("=(", 1)[1]
+    if ")" in inside:
+        body, after = inside.split(")", 1)
+        if after.strip():
+            die(f"trailing text after checksum array: {lines[start]!r}")
+        if inside.count(")") != 1:
+            die(f"malformed checksum array: {lines[start]!r}")
+        return match, body, start + 1
+    parts = [inside]
+    index = start + 1
+    while index < len(lines):
+        line = lines[index]
+        if ")" in line:
+            body, after = line.split(")", 1)
+            if after.strip():
+                die(f"trailing text after checksum array: {line!r}")
+            if line.count(")") != 1:
+                die(f"malformed checksum array: {line!r}")
+            parts.append(body)
+            return match, "\n".join(parts), index + 1
+        parts.append(line)
+        index += 1
+    die("unclosed checksum array")
+
+
+def validate_sum_body(package: str, match: re.Match[str], body: str) -> None:
+    if not SUM_INSIDE_RE.fullmatch(body):
+        die(f"illegal checksum entry in {match.group(0)}")
+    algo = match.group("algo")
+    expected = HASH_LEN[algo]
+    tokens = re.findall(r"'([^']*)'", body)
+    if not tokens:
+        die("empty checksum array")
+    for token in tokens:
+        if token == "SKIP":
+            if not package.endswith("-git"):
+                die(f"SKIP checksums are only allowed for -git packages, not {package}")
+            continue
+        if len(token) != expected:
+            die(f"{algo} checksum length {len(token)} is not {expected}")
+
+
+def normalize_pkgbuild(package: str, text: str) -> list[str]:
+    """Mask pkgver, pkgrel, and validated checksum arrays."""
+    lines = text.splitlines()
     out: list[str] = []
     index = 0
     while index < len(lines):
         line = lines[index]
-        if drop_pkgver and line.startswith("pkgver="):
-            index += 1
+        if SUM_START_RE.match(line):
+            match, body, index = consume_sum_block(lines, index)
+            validate_sum_body(package, match, body)
+            out.append("@@SUMS@@")
             continue
-        if SUM_RE.match(line):
-            balance = line.count("(") - line.count(")")
+        assign = ASSIGN_RE.fullmatch(line)
+        if line.startswith("pkgver=") or line.startswith("pkgrel="):
+            if assign is None:
+                die(f"unsafe pkgver/pkgrel line: {line!r}")
+            out.append(f"@@{assign.group(1)}@@")
             index += 1
-            while balance > 0 and index < len(lines):
-                balance += lines[index].count("(") - lines[index].count(")")
-                index += 1
             continue
         out.append(line)
         index += 1
-    return "".join(out)
+    return out
 
 
-def assert_pkgbuild_delta(package: str, baseline: str, updated: str) -> None:
-    if read_var(baseline, "pkgname") != package:
-        die(f"baseline pkgname is not {package}")
-    base_ver = read_var(baseline, "pkgver")
-    new_ver = read_var(updated, "pkgver")
-    if package.endswith("-git"):
-        if not same_pkgver_commit(base_ver, new_ver):
-            die(
-                f"{package} pkgver changed from {base_ver} to {new_ver}, "
-                "which is not the same commit"
-            )
-        drop_pkgver = True
-    else:
-        if base_ver != new_ver:
-            die(f"{package} pkgver changed from {base_ver} to {new_ver}")
-        drop_pkgver = False
-    if read_var(baseline, "pkgrel") != read_var(updated, "pkgrel"):
-        die(f"{package} pkgrel changed during the build")
-    left = strip_pkgbuild(baseline, drop_pkgver=drop_pkgver)
-    right = strip_pkgbuild(updated, drop_pkgver=drop_pkgver)
-    if left != right:
-        die(f"PKGBUILD for {package} changed beyond checksums")
-
-
-def srcinfo_values(text: str, key: str) -> list[str]:
-    prefix = f"{key} = "
-    values: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(prefix):
-            values.append(stripped[len(prefix) :].strip())
-    return values
-
-
-def assert_srcinfo(package: str, pkgbuild: str, srcinfo: str) -> None:
-    pkgver = read_var(pkgbuild, "pkgver")
-    pkgrel = read_var(pkgbuild, "pkgrel")
-    pkgname = read_var(pkgbuild, "pkgname")
-    if pkgname != package:
-        die(f"PKGBUILD pkgname {pkgname} != {package}")
-    if srcinfo_values(srcinfo, "pkgbase") != [package]:
-        die(f".SRCINFO pkgbase does not match {package}")
-    if package not in srcinfo_values(srcinfo, "pkgname"):
-        die(f".SRCINFO is missing pkgname {package}")
-    if srcinfo_values(srcinfo, "pkgver") != [pkgver]:
-        die(".SRCINFO pkgver does not match PKGBUILD")
-    if srcinfo_values(srcinfo, "pkgrel") != [pkgrel]:
-        die(".SRCINFO pkgrel does not match PKGBUILD")
-
-
-def assert_no_skip(package: str, pkgbuild: str, srcinfo: str) -> None:
-    if package.endswith("-git"):
-        return
-    if SKIP_RE.search(pkgbuild) or SRCINFO_SKIP_RE.search(srcinfo):
-        die(f"refusing SKIP checksums for {package}")
+def assert_pkgbuild_delta(package: str, baseline: str, updated: str, *, allow_source: bool) -> None:
+    if read_var(baseline, "pkgname") != package or read_var(updated, "pkgname") != package:
+        die(f"PKGBUILD pkgname is not {package}")
+    if package.endswith("-git") and not same_pkgver_commit(
+        read_var(baseline, "pkgver"), read_var(updated, "pkgver")
+    ):
+        die(
+            f"{package} pkgver changed from {read_var(baseline, 'pkgver')} "
+            f"to {read_var(updated, 'pkgver')}, which is not the same commit"
+        )
+    left = normalize_pkgbuild(package, baseline)
+    right = normalize_pkgbuild(package, updated)
+    if len(left) != len(right):
+        die("PKGBUILD changed beyond pkgver, pkgrel, and checksums")
+    for old, new in zip(left, right):
+        if old == new:
+            continue
+        if allow_source and SOURCE_RE.fullmatch(old) and SOURCE_RE.fullmatch(new):
+            continue
+        die(f"PKGBUILD changed beyond pkgver, pkgrel, and checksums: {old!r} -> {new!r}")
 
 
 def assert_not_downgrade(package: str, current: str, updated: str) -> None:
@@ -177,11 +198,7 @@ def assert_not_downgrade(package: str, current: str, updated: str) -> None:
     old_rel = read_var(current, "pkgrel")
     new_ver = read_var(updated, "pkgver")
     new_rel = read_var(updated, "pkgrel")
-    if (
-        package.endswith("-git")
-        and old_rel == new_rel
-        and same_pkgver_commit(old_ver, new_ver)
-    ):
+    if package.endswith("-git") and old_rel == new_rel and same_pkgver_commit(old_ver, new_ver):
         return
     if vercmp(f"{new_ver}-{new_rel}", f"{old_ver}-{old_rel}") < 0:
         die(
@@ -191,9 +208,9 @@ def assert_not_downgrade(package: str, current: str, updated: str) -> None:
 
 
 def parse_manifest(text: str) -> dict[str, str]:
-    data: dict[str, str] = {}
     if not text.endswith("\n"):
         die("MANIFEST must end with a newline")
+    data: dict[str, str] = {}
     for line in text.splitlines():
         if "=" not in line:
             die("invalid MANIFEST")
@@ -201,7 +218,7 @@ def parse_manifest(text: str) -> dict[str, str]:
         if not re.fullmatch(r"[a-z]+", key) or key in data:
             die("invalid MANIFEST")
         data[key] = value
-    extra = set(data) - {"status", "pkgbuild", "srcinfo"}
+    extra = set(data) - {"status", "pkgbuild"}
     if extra:
         die(f"unexpected MANIFEST keys: {sorted(extra)}")
     return data
@@ -211,8 +228,6 @@ def write_manifest(stage: Path, status: str, files: dict[str, bytes]) -> None:
     lines = [f"status={status}"]
     if "PKGBUILD" in files:
         lines.append("pkgbuild=" + hashlib.sha256(files["PKGBUILD"]).hexdigest())
-    if ".SRCINFO" in files:
-        lines.append("srcinfo=" + hashlib.sha256(files[".SRCINFO"]).hexdigest())
     path = stage / "MANIFEST"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.chmod(path, 0o644)
@@ -224,26 +239,47 @@ def empty_dir(path: Path) -> None:
         die("stage directory is not empty")
 
 
+def check_pkgbuild(
+    package: str,
+    baseline: Path,
+    candidate: Path,
+    old_version_file: Path | None,
+) -> None:
+    validate_package(package)
+    assert_pkgbuild_delta(
+        package,
+        read_text_file(baseline),
+        read_text_file(candidate),
+        allow_source=False,
+    )
+    if old_version_file is None:
+        return
+    old = read_text_file(old_version_file).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._+-]+", old):
+        die("refusing old version value")
+    updated = read_text_file(candidate)
+    new = f"{read_var(updated, 'pkgver')}-{read_var(updated, 'pkgrel')}"
+    if vercmp(new, old) <= 0:
+        die(f"refusing to publish {package}: {new} is not newer than {old}")
+
+
 def stage(package: str, baseline: Path, build_out: Path, stage_dir: Path) -> None:
     validate_package(package)
     names = list_files(build_out)
-    if names != [".SRCINFO", "PKGBUILD"]:
-        die(f"build output must contain only PKGBUILD and .SRCINFO, found {names}")
+    if names != ["PKGBUILD"]:
+        die(f"build output must contain only PKGBUILD, found {names}")
     pkg_bytes = read_bytes(build_out / "PKGBUILD")
-    src_bytes = read_bytes(build_out / ".SRCINFO")
-    pkgbuild = pkg_bytes.decode("utf-8")
-    srcinfo = src_bytes.decode("utf-8")
-    base = read_text_file(baseline)
-    assert_pkgbuild_delta(package, base, pkgbuild)
-    assert_srcinfo(package, pkgbuild, srcinfo)
-    assert_no_skip(package, pkgbuild, srcinfo)
+    assert_pkgbuild_delta(
+        package,
+        read_text_file(baseline),
+        pkg_bytes.decode("utf-8"),
+        allow_source=False,
+    )
     empty_dir(stage_dir)
-    files = {"PKGBUILD": pkg_bytes, ".SRCINFO": src_bytes}
-    for name, data in files.items():
-        target = stage_dir / name
-        target.write_bytes(data)
-        os.chmod(target, 0o644)
-    write_manifest(stage_dir, "publish", files)
+    target = stage_dir / "PKGBUILD"
+    target.write_bytes(pkg_bytes)
+    os.chmod(target, 0o644)
+    write_manifest(stage_dir, "publish", {"PKGBUILD": pkg_bytes})
 
 
 def stage_skip(stage_dir: Path) -> None:
@@ -252,7 +288,7 @@ def stage_skip(stage_dir: Path) -> None:
 
 
 def check_hash(label: str, data: bytes, expected: str | None) -> None:
-    if expected is None or not HEX64_RE.fullmatch(expected):
+    if expected is None or not re.fullmatch(r"[0-9a-f]{64}", expected or ""):
         die(f"MANIFEST is missing a sha256 for {label}")
     if hashlib.sha256(data).hexdigest() != expected:
         die(f"{label} hash does not match MANIFEST")
@@ -288,28 +324,31 @@ def import_artifact(package: str, artifact: Path, dest: Path) -> None:
         return
     if status != "publish":
         die("MANIFEST status must be publish or skip")
-    if names != [".SRCINFO", "MANIFEST", "PKGBUILD"]:
+    # .SRCINFO from the build is never accepted. The publish job regenerates it.
+    if names != ["MANIFEST", "PKGBUILD"]:
         die(f"unexpected artifact files: {names}")
     pkg_bytes = read_bytes(root / "PKGBUILD")
-    src_bytes = read_bytes(root / ".SRCINFO")
     check_hash("PKGBUILD", pkg_bytes, manifest.get("pkgbuild"))
-    check_hash(".SRCINFO", src_bytes, manifest.get("srcinfo"))
     pkgbuild = pkg_bytes.decode("utf-8")
-    srcinfo = src_bytes.decode("utf-8")
-    assert_srcinfo(package, pkgbuild, srcinfo)
-    assert_no_skip(package, pkgbuild, srcinfo)
     current_path = dest / "PKGBUILD"
     if current_path.is_symlink() or not current_path.is_file():
         die("checkout PKGBUILD must be a regular file")
-    assert_not_downgrade(package, read_text_file(current_path), pkgbuild)
+    current = read_text_file(current_path)
+    assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True)
+    assert_not_downgrade(package, current, pkgbuild)
     write_into(dest, "PKGBUILD", pkg_bytes)
-    write_into(dest, ".SRCINFO", src_bytes)
     set_output("publish", "true")
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    check_cmd = sub.add_parser("check-pkgbuild")
+    check_cmd.add_argument("--package", required=True)
+    check_cmd.add_argument("--baseline", required=True, type=Path)
+    check_cmd.add_argument("--candidate", required=True, type=Path)
+    check_cmd.add_argument("--old-version-file", type=Path)
 
     stage_cmd = sub.add_parser("stage")
     stage_cmd.add_argument("--package", required=True)
@@ -326,7 +365,12 @@ def main(argv: list[str]) -> int:
     import_cmd.add_argument("--dest", required=True, type=Path)
 
     args = parser.parse_args(argv[1:])
-    if args.cmd == "stage":
+    if args.cmd == "check-pkgbuild":
+        old = args.old_version_file
+        if old is not None and not old.is_file():
+            old = None
+        check_pkgbuild(args.package, args.baseline, args.candidate, old)
+    elif args.cmd == "stage":
         stage(args.package, args.baseline, args.build_out, args.stage)
     elif args.cmd == "stage-skip":
         stage_skip(args.stage)

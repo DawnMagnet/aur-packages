@@ -250,13 +250,22 @@ class PublishGuardTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("disabled", proc.stderr)
 
-    def test_test_build_mounts_only_the_package_read_only(self) -> None:
+    def test_test_build_seals_before_a_second_container(self) -> None:
         text = (ROOT / "scripts/test_build.sh").read_text(encoding="utf-8")
-        self.assertIn('"$pkgdir:/pkg:ro"', text)
-        self.assertIn('"$work:/work"', text)
-        self.assertIn("build_in_arch.sh:/build_in_arch.sh:ro", text)
+        seal_part, build_part = text.split("# Second container:", 1)
+        self.assertEqual(seal_part.count("docker run"), 1)
+        self.assertEqual(build_part.count("docker run"), 1)
+        self.assertIn('"$pkgdir:/pkg:ro"', seal_part)
+        self.assertIn(" seal ", seal_part)
+        self.assertIn('"$work_build/pkg:/pkg"', build_part)
+        self.assertNotIn('"$pkgdir:', build_part)
+        self.assertNotIn('"$seal:', build_part)
         self.assertNotIn('"$repo:/', text)
         self.assertNotIn("AUR_SSH_PRIVATE_KEY", text)
+        helper = (ROOT / "scripts/build_in_arch.sh").read_text(encoding="utf-8")
+        seal_helper, build_helper = helper.split('echo "builder ALL=(ALL) NOPASSWD: ALL"', 1)
+        self.assertNotIn("NOPASSWD", seal_helper)
+        self.assertIn("makepkg -s", build_helper)
 
     def test_workflow_keeps_the_job_boundary(self) -> None:
         text = (ROOT / ".github/workflows/update-aur.yml").read_text(encoding="utf-8")
@@ -266,7 +275,8 @@ class PublishGuardTest(unittest.TestCase):
         self.assertNotIn("persist-credentials: true", build)
         self.assertNotIn("AUR_SSH_PRIVATE_KEY", build)
         self.assertIn("contents: read", build)
-        self.assertIn("actions: write", build)
+        self.assertNotIn("actions: write", build)
+        self.assertIn("regen_srcinfo.sh", publish)
         self.assertIn("persist-credentials: true", publish)
         self.assertIn("environment: aur", publish)
         self.assertIn("AUR_SSH_PRIVATE_KEY", publish)

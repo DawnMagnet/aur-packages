@@ -1,9 +1,10 @@
 name: Update AUR packages
 
-# Trust boundary: build runs untrusted upstream code (makepkg). It has
-# contents: read, no AUR key, and persist-credentials: false. The package
-# directory is mounted read-only; only PKGBUILD and .SRCINFO leave via an
-# artifact. publish checks out main again and is the only job in the aur
+# Trust boundary: build runs untrusted upstream code (makepkg -s) in a second
+# container that cannot see the sealed PKGBUILD. The build job has
+# contents: read, no AUR key, and persist-credentials: false. Only the sealed
+# PKGBUILD leaves via an artifact. publish checks out main again, regenerates
+# .SRCINFO with makepkg --printsrcinfo, and is the only job in the aur
 # environment, the only job with AUR_SSH_PRIVATE_KEY, and the only job with
 # contents: write.
 
@@ -40,7 +41,6 @@ jobs:
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
       contents: read
-      actions: write
     concurrency:
       group: aur-update-${{ matrix.package }}
       cancel-in-progress: false
@@ -149,7 +149,6 @@ jobs:
           name: aur-${{ matrix.package }}
           path: ${{ runner.temp }}/aur-stage
           if-no-files-found: error
-          include-hidden-files: true
           retention-days: 1
 
   publish:
@@ -220,6 +219,12 @@ jobs:
             --package "$PACKAGE" \
             --artifact "${RUNNER_TEMP}/aur-artifact" \
             --dest "${GITHUB_WORKSPACE}/${PACKAGE}"
+
+      - name: Regenerate .SRCINFO
+        if: steps.import.outputs.publish == 'true'
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: bash scripts/regen_srcinfo.sh "$PACKAGE"
 
       - name: Show publish diff
         if: steps.import.outputs.publish == 'true'

