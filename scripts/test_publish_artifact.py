@@ -247,6 +247,48 @@ class ImportTest(unittest.TestCase):
             gate.import_artifact("cuda-api-wrappers-git", artifact, dest)
             self.assertIn("pkgver=0.8.2.r0.gc2f2a2b\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
 
+    REFLECTCPP_R10 = (
+        "pkgname=reflectcpp-git\n"
+        "pkgver=0.26.2.r10.g587b72ee\n"
+        "pkgrel=1\n"
+        "sha256sums=('SKIP')\n"
+    )
+    REFLECTCPP_R12 = REFLECTCPP_R10.replace("r10.g587b72ee", "r12.g5457ea3c")
+
+    def import_git(self, current: str, updated: str) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        artifact = root / "artifact"
+        write_pkgbuild(artifact, updated)
+        gate.write_manifest(artifact, "publish", {"PKGBUILD": (artifact / "PKGBUILD").read_bytes()})
+        dest = root / "reflectcpp-git"
+        dest.mkdir()
+        (dest / "PKGBUILD").write_text(current, encoding="utf-8")
+        gate.import_artifact("reflectcpp-git", artifact, dest)
+        return dest
+
+    def test_import_allows_a_newer_git_commit(self) -> None:
+        dest = self.import_git(self.REFLECTCPP_R10, self.REFLECTCPP_R12)
+        self.assertIn("pkgver=0.26.2.r12.g5457ea3c\n", (dest / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_import_refuses_an_older_git_commit(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            self.import_git(self.REFLECTCPP_R12, self.REFLECTCPP_R10)
+        self.assertIn("older", str(caught.exception))
+
+    def test_import_still_rejects_other_edits_on_a_git_bump(self) -> None:
+        updated = self.REFLECTCPP_R12 + "install=evil.install\n"
+        with self.assertRaises(SystemExit) as caught:
+            self.import_git(self.REFLECTCPP_R10, updated)
+        self.assertIn("changed beyond", str(caught.exception))
+
+    def test_stage_still_requires_the_same_git_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as caught:
+                StageTest().stage(Path(tmp), self.REFLECTCPP_R12, self.REFLECTCPP_R10, "reflectcpp-git")
+            self.assertIn("not the same commit", str(caught.exception))
+
     def test_skip_marker_does_not_touch_the_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

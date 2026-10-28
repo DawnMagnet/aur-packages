@@ -171,10 +171,25 @@ def normalize_pkgbuild(package: str, text: str) -> list[str]:
     return out
 
 
-def assert_pkgbuild_delta(package: str, baseline: str, updated: str, *, allow_source: bool) -> None:
+def assert_pkgbuild_delta(
+    package: str,
+    baseline: str,
+    updated: str,
+    *,
+    allow_source: bool,
+    require_same_git_commit: bool = True,
+) -> None:
+    """Allow only pkgver, pkgrel, checksum (and optionally source URL) edits.
+
+    require_same_git_commit is for stage and check-pkgbuild, where the baseline is
+    the host-generated PKGBUILD of this run and makepkg's pkgver() may only change
+    the hash length. import compares against main, which is the previous release,
+    so a -git package moving to a newer upstream commit is expected there; import
+    relies on assert_not_downgrade instead.
+    """
     if read_var(baseline, "pkgname") != package or read_var(updated, "pkgname") != package:
         die(f"PKGBUILD pkgname is not {package}")
-    if package.endswith("-git") and not same_pkgver_commit(
+    if require_same_git_commit and package.endswith("-git") and not same_pkgver_commit(
         read_var(baseline, "pkgver"), read_var(updated, "pkgver")
     ):
         die(
@@ -334,7 +349,7 @@ def import_artifact(package: str, artifact: Path, dest: Path) -> None:
     if current_path.is_symlink() or not current_path.is_file():
         die("checkout PKGBUILD must be a regular file")
     current = read_text_file(current_path)
-    assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True)
+    assert_pkgbuild_delta(package, current, pkgbuild, allow_source=True, require_same_git_commit=False)
     assert_not_downgrade(package, current, pkgbuild)
     write_into(dest, "PKGBUILD", pkg_bytes)
     set_output("publish", "true")
