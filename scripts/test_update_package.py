@@ -242,6 +242,103 @@ class UpdatePackageTest(unittest.TestCase):
         self.addCleanup(setattr, up, name, original)
 
 
+MFILE_SHA256SUMS = """\
+0022781691d94c0ceb1ea09df92ca5bce45c5404c2d487e3710276f0ece3d65e  mfile_0.1.0_linux_amd64.tar.gz
+280bcb4d3d8f7fcdef2c4e97535ef7ebfe970095d5243f922e0758b13868988b  mfile_0.1.0_linux_arm64.tar.gz
+01979c82a0959330b12acd4c84851097c141017110ff0f2e267968d6df97fc07  mfile_0.1.0_darwin_amd64.tar.gz
+d6956a080e21193ceda2a991ce756f2a660bf3967f7ee1d638ca637f78463524  mfile_0.1.0_darwin_arm64.tar.gz
+0f10bc1399621a4ac996a4b1bc597b131b5fd44e9fe261cdaaff019839031474  mfile_0.1.0_windows_amd64.zip
+"""
+
+MFILE_NEXT_SHA256SUMS = """\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mfile_0.2.0_linux_amd64.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  mfile_0.2.0_linux_arm64.tar.gz
+"""
+
+
+class MfileUpdateTest(unittest.TestCase):
+    def test_sha256sums_parser_uses_linux_assets_only(self) -> None:
+        got = up.parse_mfile_sha256sums(MFILE_SHA256SUMS, "0.1.0")
+        self.assertEqual(
+            got,
+            {
+                "x86_64": "0022781691d94c0ceb1ea09df92ca5bce45c5404c2d487e3710276f0ece3d65e",
+                "aarch64": "280bcb4d3d8f7fcdef2c4e97535ef7ebfe970095d5243f922e0758b13868988b",
+            },
+        )
+        pinned = up.mfile_pinned_sha256sums("0.1.0", MFILE_SHA256SUMS)
+        self.assertEqual(pinned["sha256sums_x86_64"], [got["x86_64"]])
+        self.assertEqual(pinned["sha256sums_aarch64"], [got["aarch64"]])
+
+    def test_sha256sums_parser_rejects_a_missing_arch(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            up.parse_mfile_sha256sums(MFILE_SHA256SUMS, "9.9.9")
+        self.assertIn("missing", str(caught.exception))
+
+    def test_single_source_array_cannot_be_updated(self) -> None:
+        text = "pkgname=mfile-bin\npkgver=0.1.0\npkgrel=1\nsource=(\"https://example.invalid/mfile.tar.gz\")\nsha256sums=('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')\n"
+        with self.assertRaises(SystemExit) as caught:
+            up.apply_mfile_sources_and_sums(text, "0.1.0", MFILE_SHA256SUMS)
+        self.assertIn("could not set source_x86_64", str(caught.exception))
+
+    def test_bump_rewrites_both_arch_sources_and_checksums(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up.ROOT = root
+            self.addCleanup(setattr, up, "ROOT", ROOT)
+            pkg = root / "mfile-bin"
+            pkg.mkdir()
+            original = "\n".join(
+                [
+                    "pkgname=mfile-bin",
+                    "pkgver=0.1.0",
+                    "pkgrel=4",
+                    'source_x86_64=("https://example.invalid/old-amd64.tar.gz")',
+                    'source_aarch64=("https://example.invalid/old-arm64.tar.gz")',
+                    "sha256sums_x86_64=('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')",
+                    "sha256sums_aarch64=('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')",
+                    "",
+                ]
+            )
+            (pkg / "PKGBUILD").write_text(original, encoding="utf-8")
+            self._patch("choose_release_version", lambda name: "0.2.0")
+            self._patch("fetch_mfile_sha256sums", lambda pkgver: MFILE_NEXT_SHA256SUMS)
+            up.update_mfile()
+            text = (pkg / "PKGBUILD").read_text(encoding="utf-8")
+            self.assertEqual(up.read_var(text, "pkgver"), "0.2.0")
+            self.assertEqual(up.read_var(text, "pkgrel"), "1")
+            self.assertIn(f'source_x86_64=("{up.mfile_source_item("x86_64")}")', text)
+            self.assertIn(f'source_aarch64=("{up.mfile_source_item("aarch64")}")', text)
+            self.assertNotIn("example.invalid", text)
+            self.assertIn("sha256sums_x86_64=('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')", text)
+            self.assertIn("sha256sums_aarch64=('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')", text)
+            self.assertEqual((pkg / ".update-old-version").read_text(encoding="utf-8").strip(), "0.1.0-4")
+
+    def test_current_release_does_not_rewrite_the_pkgbuild(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up.ROOT = root
+            self.addCleanup(setattr, up, "ROOT", ROOT)
+            pkg = root / "mfile-bin"
+            pkg.mkdir()
+            text = (ROOT / "mfile-bin" / "PKGBUILD").read_text(encoding="utf-8")
+            (pkg / "PKGBUILD").write_text(text, encoding="utf-8")
+            self._patch("choose_release_version", lambda name: "0.1.0")
+            self._patch("fetch_mfile_sha256sums", lambda pkgver: MFILE_SHA256SUMS)
+            up.update_mfile()
+            self.assertEqual((pkg / "PKGBUILD").read_text(encoding="utf-8"), text)
+            self.assertFalse((pkg / ".update-old-version").exists())
+
+    def _patch(self, name: str, value: object) -> None:
+        original = getattr(up, name)
+        setattr(up, name, value)
+        self.addCleanup(setattr, up, name, original)
+
+
 class CiShouldBuildTest(unittest.TestCase):
     def decide(self, changed: str, event: str, force: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -361,23 +458,23 @@ class PublishGuardTest(unittest.TestCase):
             "maple-mono-nf-cn",
             "memprocfs",
             "moonbit-bin",
+            "mfile-bin",
             "cuda-api-wrappers-git",
             "reflectcpp-git",
         ):
             self.assertEqual(text.count(f"package: {package}"), 2)
+        self.assertIn('"mfile-bin/**"', text)
         dependabot = (ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
         self.assertIn("package-ecosystem: github-actions", dependabot)
         self.assertIn("interval: weekly", dependabot)
 
-    def test_moonbit_pkgrel_is_2_and_conflicts_moon_bin(self) -> None:
+    def test_moonbit_conflicts_moon_bin_and_srcinfo_matches_pkgrel(self) -> None:
         pkgbuild = (ROOT / "moonbit-bin/PKGBUILD").read_text(encoding="utf-8")
         srcinfo = (ROOT / "moonbit-bin/.SRCINFO").read_text(encoding="utf-8")
-        self.assertIn("pkgrel=2", pkgbuild)
         self.assertIn("conflicts=(\"moonbit\" \"moon-bin\")", pkgbuild)
-        self.assertIn("\tpkgrel = 2\n", srcinfo)
         self.assertIn("\tconflicts = moon-bin\n", srcinfo)
-        self.assertNotIn("pkgrel=1", pkgbuild)
-        self.assertNotIn("pkgrel = 1", srcinfo)
+        rel = up.read_var(pkgbuild, "pkgrel")
+        self.assertIn(f"\tpkgrel = {rel}\n", srcinfo)
 
 
 if __name__ == "__main__":

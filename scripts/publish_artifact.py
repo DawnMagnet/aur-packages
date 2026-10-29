@@ -722,7 +722,7 @@ def assert_host_pkgver(
     tell two hashes of the same rN apart or stop a huge rN that would block
     every later update. For -git packages the publish job recomputes the
     pkgver from upstream (publish_artifact.py expect) and passes it in here.
-    For the release packages (maple-mono-nf-cn, memprocfs, moonbit-bin) it
+    For the release packages (maple-mono-nf-cn, memprocfs, moonbit-bin, mfile-bin) it
     recomputes pkgver and pkgrel (publish_artifact.py expect-release) and
     both must match exactly. A missing value fails closed for all of them.
     Other packages are unchanged unless a value is passed.
@@ -837,6 +837,16 @@ def expect_release(package: str, artifact: Path, main_pkgbuild: Path, fetch=None
     if not sources:
         die(f"{package}: the expected PKGBUILD has no source array")
     sums = host_sha256sums(package, sources, expected_text, main_pkgbuild.parent, fetch)
+    if package == "mfile-bin":
+        # Checksums are the release SHA256SUMS lines. The host still hashes
+        # the tarball bytes above; a mismatch with SHA256SUMS fails closed.
+        pinned = update_package.mfile_pinned_sha256sums(pkgver)
+        if sums != pinned:
+            die(
+                "mfile-bin: sha256 of the release tarballs does not match "
+                f"SHA256SUMS ({sums} != {pinned})"
+            )
+        sums = pinned
     set_output("pkgver", pkgver)
     set_output("pkgrel", pkgrel)
     set_output("sources", json.dumps(sources, separators=(",", ":"), sort_keys=True))

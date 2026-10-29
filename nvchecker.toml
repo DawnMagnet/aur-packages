@@ -8,6 +8,8 @@
 #
 # memprocfs and moonbit-bin use cmd sources because their version is not the
 # GitHub tag (asset build+date, or `moon version` inside the latest tarball).
+# mfile-bin tracks GitHub releases. The upstream default branch is master;
+# versions are release tags (prefix v), not the branch tip.
 
 [__config__]
 oldver = "old_ver.json"
@@ -28,6 +30,13 @@ cmd = "python3 scripts/nvchecker_memprocfs.py"
 [moonbit-bin]
 source = "cmd"
 cmd = "python3 scripts/nvchecker_moonbit.py"
+
+[mfile-bin]
+source = "github"
+github = "DawnMagnet/mfile"
+use_latest_release = true
+prefix = "v"
+exclude_regex = ".*(alpha|beta|rc|pre).*"
 
 [cuda-api-wrappers-git]
 source = "github"

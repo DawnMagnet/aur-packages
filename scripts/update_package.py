@@ -216,6 +216,25 @@ def set_quoted_array(text: str, name: str, url: str) -> str:
     return new
 
 
+def set_sha256sum(text: str, name: str, digest: str) -> str:
+    """Replace one single-line sha256sums or sha256sums_<arch> entry."""
+    if not re.fullmatch(r"sha256sums(?:_[A-Za-z0-9_]+)?", name):
+        raise SystemExit(f"refusing checksum array name {name!r}")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"refusing checksum for {name}")
+    pattern = rf"^{re.escape(name)}=\('(?:[0-9a-f]+|SKIP)'\)$"
+    new, count = re.subn(
+        pattern,
+        lambda _m: f"{name}=('{digest}')",
+        text,
+        count=1,
+        flags=re.M,
+    )
+    if count != 1:
+        raise SystemExit(f"could not set {name}")
+    return new
+
+
 def bump_pkgver(text: str, new_ver: str) -> str:
     """Set pkgver and reset pkgrel to 1.
 
@@ -430,6 +449,148 @@ def probe_moonbit(*, with_core: bool = True, sandbox: bool = False) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# mfile-bin publishes one tarball per Arch arch. The PKGBUILD names are
+# source_<arch> / sha256sums_<arch>. Digests are the lines in the release
+# SHA256SUMS file for the upstream asset names, not a re-hash invented here.
+# The repository default branch is master; versions come from release tags.
+MFILE_REPO = "DawnMagnet/mfile"
+MFILE_ARCHES = ("x86_64", "aarch64")
+MFILE_GOARCH = {"x86_64": "amd64", "aarch64": "arm64"}
+SHA256SUMS_LINE = re.compile(r"^([0-9a-f]{64}) [ *](\S+)$")
+
+
+def mfile_source_item(arch: str) -> str:
+    """PKGBUILD source item for one arch. ${pkgver} stays literal."""
+    if arch not in MFILE_GOARCH:
+        raise SystemExit(f"unknown mfile arch {arch}")
+    goarch = MFILE_GOARCH[arch]
+    return (
+        "${pkgname}-${pkgver}-"
+        + arch
+        + ".tar.gz::https://github.com/DawnMagnet/mfile/releases/download/v${pkgver}/mfile_${pkgver}_linux_"
+        + goarch
+        + ".tar.gz"
+    )
+
+
+def mfile_asset_name(pkgver: str, arch: str) -> str:
+    return f"mfile_{pkgver}_linux_{MFILE_GOARCH[arch]}.tar.gz"
+
+
+def parse_mfile_sha256sums(text: str, pkgver: str) -> dict[str, str]:
+    """Map Arch arch -> sha256 from a sha256sum(1) SHA256SUMS file.
+
+    Extra assets (darwin, windows) are ignored. Both linux assets are required.
+    """
+    if not re.fullmatch(r"[0-9A-Za-z.][0-9A-Za-z._]*", pkgver):
+        raise SystemExit(f"refusing mfile pkgver {pkgver!r}")
+    found: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = SHA256SUMS_LINE.fullmatch(line)
+        if match is None:
+            raise SystemExit(f"malformed SHA256SUMS line: {line!r}")
+        digest, name = match.group(1), match.group(2)
+        if name in found:
+            raise SystemExit(f"duplicate SHA256SUMS entry {name}")
+        found[name] = digest
+    out: dict[str, str] = {}
+    for arch in MFILE_ARCHES:
+        asset = mfile_asset_name(pkgver, arch)
+        digest = found.get(asset)
+        if digest is None:
+            raise SystemExit(f"SHA256SUMS for v{pkgver} is missing {asset}")
+        out[arch] = digest
+    return out
+
+
+def download_release_text(url: str, *, limit: int = 1024 * 1024) -> str:
+    """GET an https URL and return the body as text. Redirects must stay https."""
+    if not re.fullmatch(r"https://[A-Za-z0-9._~:/?#@%+=&!,;-]{1,2000}", url):
+        raise SystemExit(f"refusing URL {url!r}")
+
+    class _HttpsRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if not str(newurl).startswith("https://"):
+                raise SystemExit(f"refusing redirect to {newurl!r}")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(_HttpsRedirect)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "aur-packages", "Accept": "text/plain,*/*"}
+    )
+    try:
+        with opener.open(request, timeout=60) as resp:
+            final = resp.geturl()
+            if not str(final).startswith("https://"):
+                raise SystemExit(f"refusing final URL {final!r}")
+            if getattr(resp, "status", 200) != 200:
+                raise SystemExit(f"download of {url} returned HTTP {resp.status}")
+            data = resp.read(limit + 1)
+    except SystemExit:
+        raise
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        raise SystemExit(f"download of {url} failed: {exc}") from exc
+    if len(data) > limit:
+        raise SystemExit(f"download of {url} is too large")
+    return data.decode("utf-8")
+
+
+def fetch_mfile_sha256sums(pkgver: str) -> str:
+    """Download SHA256SUMS for one mfile release tag v<pkgver>."""
+    if not re.fullmatch(r"[0-9A-Za-z.][0-9A-Za-z._]*", pkgver):
+        raise SystemExit(f"refusing mfile pkgver {pkgver!r}")
+    url = f"https://github.com/{MFILE_REPO}/releases/download/v{pkgver}/SHA256SUMS"
+    return download_release_text(url, limit=64 * 1024)
+
+
+def mfile_pinned_sha256sums(pkgver: str, sums_text: str | None = None) -> dict[str, list[str]]:
+    """sha256sums_<arch> arrays taken from the release SHA256SUMS file."""
+    text = fetch_mfile_sha256sums(pkgver) if sums_text is None else sums_text
+    digests = parse_mfile_sha256sums(text, pkgver)
+    return {f"sha256sums_{arch}": [digests[arch]] for arch in MFILE_ARCHES}
+
+
+def apply_mfile_sources_and_sums(text: str, pkgver: str, sums_text: str) -> str:
+    """Rewrite both per-arch source arrays and both sha256sums_* arrays.
+
+    A PKGBUILD that only has a single source=() array cannot be updated:
+    set_quoted_array / set_sha256sum require source_<arch> and sha256sums_<arch>.
+    """
+    digests = parse_mfile_sha256sums(sums_text, pkgver)
+    for arch in MFILE_ARCHES:
+        text = set_quoted_array(text, f"source_{arch}", mfile_source_item(arch))
+        text = set_sha256sum(text, f"sha256sums_{arch}", digests[arch])
+    return text
+
+
+def update_mfile() -> None:
+    # nvchecker.toml is a github release entry (DawnMagnet/mfile, prefix v).
+    text = read_pkgbuild("mfile-bin")
+    old_ver = read_var(text, "pkgver")
+    old_rel = read_var(text, "pkgrel")
+    new_ver = choose_release_version("mfile-bin")
+    sums_text = fetch_mfile_sha256sums(new_ver)
+    old_full = full_version(old_ver, old_rel)
+    if new_ver == old_ver:
+        refreshed = apply_mfile_sources_and_sums(text, new_ver, sums_text)
+        if refreshed != text:
+            raise SystemExit(
+                "mfile-bin is at the upstream version but source_<arch> or "
+                "sha256sums_<arch> does not match the release SHA256SUMS"
+            )
+        mark_unchanged("mfile-bin", old_full)
+        return
+    new_full = full_version(new_ver, "1")
+    require_newer("mfile-bin", old_full, new_full)
+    text = apply_mfile_sources_and_sums(text, new_ver, sums_text)
+    text = bump_pkgver(text, new_ver)
+    write_pkgbuild("mfile-bin", text)
+    mark_changed("mfile-bin", old_full, new_full)
+
+
 def update_moonbit() -> None:
     # nvchecker.toml runs scripts/nvchecker_moonbit.py, which calls this probe.
     info = probe_moonbit()
@@ -449,7 +610,7 @@ def update_moonbit() -> None:
     mark_changed("moonbit-bin", old_full, new_full)
 
 
-RELEASE_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin")
+RELEASE_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin", "mfile-bin")
 PKGREL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 
@@ -489,6 +650,12 @@ def expected_release_pkgbuild(pkg: str, main_pkgbuild: str) -> tuple[str, str, s
         log(info["moon_output"])
         pkgver = info["pkgver"]
         pkgrel = main_rel if pkgver == main_ver else "1"
+    elif pkg == "mfile-bin":
+        pkgver = choose_release_version(pkg, use_nvchecker=False)
+        pkgrel = main_rel if pkgver == main_ver else "1"
+        # Both source_<arch> arrays and both sha256sums_<arch> arrays. The
+        # digests are the release SHA256SUMS lines. Source URLs keep ${pkgver}.
+        text = apply_mfile_sources_and_sums(text, pkgver, fetch_mfile_sha256sums(pkgver))
     else:
         raise SystemExit(f"{pkg} is not a release package")
     if not PKGVER_RE.fullmatch(pkgver) or not PKGREL_RE.fullmatch(pkgrel):
@@ -635,6 +802,7 @@ UPDATERS = {
     "maple-mono-nf-cn": update_maple,
     "memprocfs": update_memprocfs,
     "moonbit-bin": update_moonbit,
+    "mfile-bin": update_mfile,
     "cuda-api-wrappers-git": lambda: update_git(
         "cuda-api-wrappers-git", GIT_REPOS["cuda-api-wrappers-git"]
     ),

@@ -26,6 +26,7 @@ on:
       - "maple-mono-nf-cn/**"
       - "memprocfs/**"
       - "moonbit-bin/**"
+      - "mfile-bin/**"
       - "cuda-api-wrappers-git/**"
       - "reflectcpp-git/**"
       - "nvchecker.toml"
@@ -57,6 +58,9 @@ jobs:
             free_disk: false
           - package: moonbit-bin
             timeout: 60
+            free_disk: false
+          - package: mfile-bin
+            timeout: 45
             free_disk: false
           - package: cuda-api-wrappers-git
             timeout: 180
@@ -107,9 +111,11 @@ jobs:
 
       # Read-only AUR RPC lookup. A repo version newer than the AUR is
       # treated as changed; an AUR version newer than the repo, or a package
-      # missing on the AUR, fails the job. If the RPC cannot be read, the
-      # comparison is skipped and changed stays as update_package.py set it,
-      # so the RPC alone never triggers a publish.
+      # missing on the AUR, fails the job. mfile-bin is the only hard-coded
+      # exception: a definitive resultcount 0 (not an RPC error) sets
+      # changed=true so the existing publish path can create it. If the RPC
+      # cannot be read, the comparison is skipped and changed stays as
+      # update_package.py set it, so the RPC alone never triggers a publish.
       - name: Compare with the AUR
         id: aur
         env:
@@ -189,6 +195,9 @@ jobs:
             free_disk: false
           - package: moonbit-bin
             timeout: 60
+            free_disk: false
+          - package: mfile-bin
+            timeout: 45
             free_disk: false
           - package: cuda-api-wrappers-git
             timeout: 180

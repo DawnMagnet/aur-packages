@@ -64,6 +64,16 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(url, "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=moonbit-bin")
         self.assertGreater(timeout, 0)
 
+    def test_mfile_bin_does_not_match_libmfile(self) -> None:
+        body = rpc_body("mfile", "r57.a18a066-1")
+        with self.assertRaises(aur_rpc.RpcError):
+            aur_rpc.parse_response("mfile-bin", body)
+        self.assertIsNone(aur_rpc.parse_response("mfile-bin", rpc_body(None)))
+        changed, reason = aur_rpc.decide("mfile-bin", False, "0.1.0-1", None)
+        self.assertTrue(changed)
+        self.assertEqual(reason, "first publish: mfile-bin")
+        self.assertNotIn("r57.a18a066", reason)
+
     def test_missing_package_is_none(self) -> None:
         opener = Opener(rpc_body(None))
         self.assertIsNone(aur_rpc.fetch_aur_version("moonbit-bin", opener=opener, sleep=no_sleep))
@@ -272,6 +282,177 @@ class WorkflowTest(unittest.TestCase):
         self.assertLess(build.index("id: upd"), build.index("id: aur"))
         self.assertLess(build.index("id: aur"), build.index("id: gate"))
         self.assertNotIn("aur_rpc.py", text.split("\n  publish:\n", 1)[1])
+
+
+class FirstPublishTest(unittest.TestCase):
+    """Bootstrap is mfile-bin only, and only on a definitive empty RPC result."""
+
+    PKG = "pkgname=mfile-bin\npkgver=0.1.0\npkgrel=1\n"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        out = self.root / "github_output"
+        out.write_text("", encoding="utf-8")
+        patcher = mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.output = out
+
+    def outputs(self) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in self.output.read_text(encoding="utf-8").splitlines())
+
+    def compare(self, changed: bool, aur) -> bool:
+        dest = self.root / "mfile-bin"
+        if dest.exists():
+            for child in dest.iterdir():
+                child.unlink()
+            dest.rmdir()
+        dest.mkdir()
+        (dest / "PKGBUILD").write_text(self.PKG, encoding="utf-8")
+
+        def fetch(package: str):
+            self.assertEqual(package, "mfile-bin")
+            if isinstance(aur, Exception):
+                raise aur
+            return aur
+
+        return aur_rpc.compare("mfile-bin", changed, dest, fetch=fetch)
+
+    def test_allowlist_is_exactly_mfile_bin(self) -> None:
+        self.assertEqual(aur_rpc.FIRST_PUBLISH_ALLOWLIST, ("mfile-bin",))
+        with mock.patch.dict(
+            os.environ,
+            {"FIRST_PUBLISH_ALLOWLIST": "mfile", "AUR_FIRST_PUBLISH": "1"},
+        ):
+            self.assertEqual(aur_rpc.FIRST_PUBLISH_ALLOWLIST, ("mfile-bin",))
+            with self.assertRaises(SystemExit) as caught:
+                aur_rpc.decide("mfile", False, "1.0-1", None)
+            self.assertIn("no such package", str(caught.exception))
+            self.assertNotIn("first publish", str(caught.exception))
+
+    def test_absent_mfile_bin_is_created(self) -> None:
+        opener = Opener(rpc_body(None))
+        aur_rpc.require_bootstrap_absence("mfile-bin", opener=opener, sleep=no_sleep)
+        self.assertEqual(opener.calls[0][0], "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=mfile-bin")
+        self.assertTrue(self.compare(False, None))
+        self.assertEqual(self.outputs()["changed"], "true")
+        self.assertEqual(self.outputs()["aur_version"], "")
+        self.assertFalse((self.root / "mfile-bin/.update-old-version").exists())
+
+    def test_present_mfile_bin_uses_the_normal_path(self) -> None:
+        opener = Opener(rpc_body("mfile-bin", "0.1.0-1"))
+        with self.assertRaises(SystemExit) as caught:
+            aur_rpc.require_bootstrap_absence("mfile-bin", opener=opener, sleep=no_sleep)
+        self.assertIn("first publish denied", str(caught.exception))
+        self.assertFalse(self.compare(False, "0.1.0-1"))
+        self.assertEqual(self.outputs()["changed"], "false")
+        changed, reason = aur_rpc.decide("mfile-bin", False, "0.1.0-1", "0.1.0-1")
+        self.assertFalse(changed)
+        self.assertNotEqual(reason, "first publish: mfile-bin")
+
+    def test_other_package_absent_still_fails(self) -> None:
+        for name in ("moonbit-bin", "mfile", "mfile-bin2"):
+            with self.subTest(name=name):
+                with self.assertRaises(SystemExit) as caught:
+                    aur_rpc.decide(name, False, "1.0-1", None)
+                self.assertIn("no such package", str(caught.exception))
+                self.assertNotIn("first publish", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            aur_rpc.require_bootstrap_absence("mfile", opener=Opener(rpc_body(None)), sleep=no_sleep)
+        self.assertIn("denied", str(caught.exception))
+
+    def test_rpc_failures_deny_bootstrap(self) -> None:
+        bodies = [
+            urllib.error.URLError("timeout"),
+            TimeoutError("timed out"),
+            urllib.error.HTTPError("u", 503, "unavailable", {}, None),  # type: ignore[arg-type]
+            b"not json",
+            json.dumps({"type": "error", "error": "Incorrect request type", "resultcount": 0, "results": []}).encode(),
+            json.dumps({"type": "multiinfo", "resultcount": 0, "results": [], "error": "nope"}).encode(),
+            json.dumps({"type": "search", "resultcount": 0, "results": []}).encode(),
+            json.dumps({"type": "multiinfo", "resultcount": 0, "results": [{"Name": "mfile", "Version": "r57.a18a066-1"}]}).encode(),
+            json.dumps({"type": "multiinfo", "results": []}).encode(),
+        ]
+        for body in bodies:
+            with self.subTest(body=repr(body)[:80]):
+                items = (body,) * aur_rpc.ATTEMPTS
+                opener = Opener(*items)
+                with self.assertRaises(SystemExit) as caught:
+                    aur_rpc.require_bootstrap_absence("mfile-bin", opener=opener, sleep=no_sleep)
+                self.assertIn("first publish denied", str(caught.exception))
+                self.assertNotIn("r57.a18a066", str(caught.exception))
+        self.output.write_text("", encoding="utf-8")
+        self.assertFalse(self.compare(False, aur_rpc.RpcError("timeout")))
+        self.assertEqual(self.outputs()["changed"], "false")
+
+    def test_nonempty_aur_repo_stops(self) -> None:
+        repo = self.root / "aur"
+        repo.mkdir()
+        subprocess_git = ["git", "-C", str(repo)]
+        import subprocess
+        subprocess.check_call(["git", "init", "-q", str(repo)])
+        (repo / "PKGBUILD").write_text("pkgname=mfile-bin\n", encoding="utf-8")
+        subprocess.check_call(subprocess_git + ["add", "PKGBUILD"])
+        subprocess.check_call(subprocess_git + ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "seed"])
+        with self.assertRaises(SystemExit) as caught:
+            aur_rpc.require_empty_repo(repo)
+        self.assertIn("not an empty", str(caught.exception))
+        empty = self.root / "empty"
+        subprocess.check_call(["git", "init", "-q", str(empty)])
+        aur_rpc.require_empty_repo(empty)
+
+    def test_extra_file_is_rejected(self) -> None:
+        aur_rpc.assert_bootstrap_files([".SRCINFO", "PKGBUILD"])
+        aur_rpc.assert_bootstrap_files(["PKGBUILD", ".SRCINFO"])
+        for names in (
+            ["PKGBUILD", ".SRCINFO", "INSTALL"],
+            ["PKGBUILD"],
+            ["PKGBUILD", ".SRCINFO", ".SRCINFO"],
+            [],
+        ):
+            with self.subTest(names=names):
+                with self.assertRaises(SystemExit) as caught:
+                    aur_rpc.assert_bootstrap_files(names)
+                self.assertIn("exactly PKGBUILD and .SRCINFO", str(caught.exception))
+
+    def test_confirm_requires_the_published_version(self) -> None:
+        aur_rpc.confirm_published(
+            "mfile-bin", "0.1.0-1", fetch=lambda: "0.1.0-1", attempts=1, sleep=no_sleep
+        )
+        seen = {"n": 0}
+
+        def later() -> str | None:
+            seen["n"] += 1
+            return None if seen["n"] == 1 else "0.1.0-1"
+
+        aur_rpc.confirm_published("mfile-bin", "0.1.0-1", fetch=later, attempts=3, sleep=no_sleep)
+        with self.assertRaises(SystemExit) as caught:
+            aur_rpc.confirm_published(
+                "mfile-bin", "0.1.0-1", fetch=lambda: "9.9.9-1", attempts=1, sleep=no_sleep
+            )
+        self.assertIn("expected '0.1.0-1'", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            def boom() -> str | None:
+                raise aur_rpc.RpcError("timeout")
+            aur_rpc.confirm_published("mfile-bin", "0.1.0-1", fetch=boom, attempts=2, sleep=no_sleep)
+        self.assertIn("failed confirmation", str(caught.exception))
+        with self.assertRaises(SystemExit):
+            aur_rpc.confirm_published("mfile", "0.1.0-1", fetch=lambda: "0.1.0-1", attempts=1, sleep=no_sleep)
+
+    def test_publish_script_plain_push_and_exact_files(self) -> None:
+        text = (ROOT / "scripts/publish.sh").read_text(encoding="utf-8")
+        self.assertNotIn("--force", text)
+        self.assertIn('echo "first publish: mfile-bin"', text)
+        self.assertIn("assert-files", text)
+        self.assertIn("bootstrap-check", text)
+        self.assertIn('git -C "$stage" push origin HEAD:master', text)
+        workflow = (ROOT / ".github/workflows/update-aur.yml").read_text(encoding="utf-8")
+        publish = workflow.split("\n  publish:\n", 1)[1]
+        self.assertLess(publish.index("expect-release"), publish.index("publish.sh"))
+        self.assertIn("environment: aur", publish)
+        self.assertIn("ref: main", workflow)
 
 
 if __name__ == "__main__":
