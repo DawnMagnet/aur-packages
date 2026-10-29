@@ -2,7 +2,7 @@
 pkgname=mfile-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Static file-type identifier using Google Magika'
+pkgdesc='Fast, static file(1) replacement with an embedded content-type model'
 arch=('x86_64' 'aarch64')
 url='https://github.com/DawnMagnet/mfile'
 license=('Apache-2.0')
