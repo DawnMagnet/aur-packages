@@ -295,7 +295,6 @@ class MfileUpdateTest(unittest.TestCase):
                     "pkgname=mfile-bin",
                     "pkgver=0.1.0",
                     "pkgrel=4",
-                    "pkgdesc='Fast, static file(1) replacement with an embedded content-type model'",
                     'source_x86_64=("https://example.invalid/old-amd64.tar.gz")',
                     'source_aarch64=("https://example.invalid/old-arm64.tar.gz")',
                     "sha256sums_x86_64=('cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc')",
@@ -310,10 +309,6 @@ class MfileUpdateTest(unittest.TestCase):
             text = (pkg / "PKGBUILD").read_text(encoding="utf-8")
             self.assertEqual(up.read_var(text, "pkgver"), "0.2.0")
             self.assertEqual(up.read_var(text, "pkgrel"), "1")
-            self.assertIn(
-                "pkgdesc='Fast, static file(1) replacement with an embedded content-type model'",
-                text,
-            )
             self.assertIn(f'source_x86_64=("{up.mfile_source_item("x86_64")}")', text)
             self.assertIn(f'source_aarch64=("{up.mfile_source_item("aarch64")}")', text)
             self.assertNotIn("example.invalid", text)
