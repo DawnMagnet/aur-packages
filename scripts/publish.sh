@@ -92,15 +92,63 @@ fi
 
 export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts_aur -o ConnectTimeout=20"
 
+# Shallow clone of a brand-new empty AUR repo can fail. A full clone is
+# still a normal fetch, not a forced update. Only mfile-bin, and only when
+# the RPC definitively says it is absent, may take that path.
+clone_aur() {
+  local dest="$1"
+  if git clone --depth 1 "ssh://aur@aur.archlinux.org/${pkg}.git" "$dest"; then
+    return 0
+  fi
+  rm -rf "$dest"
+  if python3 "$repo/scripts/aur_rpc.py" package-absent --package "$pkg"; then
+    git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "$dest"
+    return $?
+  fi
+  return 1
+}
+
+bootstrap_aur() {
+  local stage="$1"
+  # Definitive absence, hard-coded allowlist, and an empty clone. This logs
+  # "first publish: mfile-bin" or exits non-zero.
+  python3 "$repo/scripts/aur_rpc.py" bootstrap-check --package "$pkg" --repo "$stage"
+  echo "first publish: mfile-bin"
+  if [[ ! -f "$repo/$pkg/PKGBUILD" || ! -f "$repo/$pkg/.SRCINFO" ]]; then
+    echo "bootstrap requires PKGBUILD and .SRCINFO" >&2
+    return 1
+  fi
+  install -m 644 "$repo/$pkg/PKGBUILD" "$stage/PKGBUILD"
+  install -m 644 "$repo/$pkg/.SRCINFO" "$stage/.SRCINFO"
+  python3 "$repo/scripts/aur_rpc.py" assert-files \
+    $(find "$stage" -mindepth 1 -maxdepth 1 ! -name .git -printf '%f\n')
+  git -C "$stage" add -- PKGBUILD .SRCINFO
+  python3 "$repo/scripts/aur_rpc.py" assert-files \
+    $(git -C "$stage" diff --cached --name-only)
+  git -C "$stage" -c user.name="DawnMagnet" -c user.email="DawnMagnet@users.noreply.github.com" \
+    commit -m "Update to $ver"
+  python3 "$repo/scripts/aur_rpc.py" assert-files \
+    $(git -C "$stage" ls-tree -r --name-only HEAD)
+  # Plain push of that one commit.
+  git -C "$stage" push origin HEAD:master
+  python3 "$repo/scripts/aur_rpc.py" confirm --package "$pkg" --version "$ver"
+}
+
 push_aur() {
   local attempt stage
   for attempt in 1 2 3 4; do
     stage="$(mktemp -d)"
-    if ! git clone --depth 1 "ssh://aur@aur.archlinux.org/${pkg}.git" "$stage"; then
+    if ! clone_aur "$stage"; then
       echo "AUR clone failed (attempt $attempt)" >&2
       rm -rf "$stage"
       sleep $((attempt * 3))
       continue
+    fi
+    if ! git -C "$stage" rev-parse --verify --quiet HEAD >/dev/null; then
+      # Not in a conditional, so a failed check or push aborts the job.
+      bootstrap_aur "$stage"
+      rm -rf "$stage"
+      return 0
     fi
     # Replace package files. Do not --delete: extra AUR files stay in history
     # until a normal commit removes them, and we never rewrite history.
