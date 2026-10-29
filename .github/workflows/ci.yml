@@ -1,0 +1,60 @@
+name: CI
+
+# Pull-request checks. This does not publish and does not run the update
+# flow for any package except a read-only detection of mfile-bin.
+# update-aur.yml remains the only workflow that builds or publishes.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests and mfile-bin detection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Unit tests
+        run: PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_*.py'
+
+      - name: Detect mfile-bin upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Only mfile-bin. Do not invoke the updater for any other package.
+          python3 scripts/update_package.py mfile-bin >"$RUNNER_TEMP/mfile.out" 2>"$RUNNER_TEMP/mfile.err"
+          cat "$RUNNER_TEMP/mfile.err"
+          cat "$RUNNER_TEMP/mfile.out"
+          if grep -q '^changed=false$' "$RUNNER_TEMP/mfile.out"; then
+            echo "mfile-bin: no change"
+          elif grep -q '^changed=true$' "$RUNNER_TEMP/mfile.out"; then
+            echo "mfile-bin: new package first publish"
+          else
+            echo "mfile-bin detection did not report changed" >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, urllib.parse, urllib.request
+          url = "https://aur.archlinux.org/rpc/v5/info?" + urllib.parse.urlencode({"arg[]": "mfile-bin"})
+          req = urllib.request.Request(
+              url, headers={"User-Agent": "aur-packages", "Accept": "application/json"}
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              data = json.load(resp)
+          names = [row.get("Name") for row in data.get("results") or [] if isinstance(row, dict)]
+          if "mfile" in names:
+              raise SystemExit("refusing to treat unrelated AUR package mfile as mfile-bin")
+          if names not in ([], ["mfile-bin"]):
+              raise SystemExit(f"unexpected AUR names for mfile-bin: {names}")
+          print("AUR mfile-bin lookup:", names or "absent (not the unrelated package mfile)")
+          PY

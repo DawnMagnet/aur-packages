@@ -306,6 +306,68 @@ class ExpectReleaseTest(Base):
         self.assertEqual(self.outputs(), {"pkgver": "", "pkgrel": "", "sources": "", "sha256sums": ""})
         self.assertEqual(self.fetch.urls, [])
 
+    def test_mfile_checksums_come_from_sha256sums(self) -> None:
+        sums = (
+            "0022781691d94c0ceb1ea09df92ca5bce45c5404c2d487e3710276f0ece3d65e  mfile_0.1.0_linux_amd64.tar.gz\n"
+            "280bcb4d3d8f7fcdef2c4e97535ef7ebfe970095d5243f922e0758b13868988b  mfile_0.1.0_linux_arm64.tar.gz\n"
+        )
+        main = self.root / "mfile-bin/PKGBUILD"
+        text = main.read_text(encoding="utf-8")
+        art = self.artifact(text)
+        before = tree_digest(self.root)
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.1.0"), mock.patch.object(
+            up, "fetch_mfile_sha256sums", lambda pkgver: sums
+        ):
+            gate.expect_release("mfile-bin", art, main, committed_fetch("mfile-bin", text))
+        outs = self.outputs()
+        self.assertEqual(outs["pkgver"], "0.1.0")
+        self.assertEqual(outs["pkgrel"], up.read_var(text, "pkgrel"))
+        sources = json.loads(outs["sources"])
+        self.assertEqual(set(sources), {"source_x86_64", "source_aarch64"})
+        self.assertEqual(
+            json.loads(outs["sha256sums"]),
+            up.mfile_pinned_sha256sums("0.1.0", sums),
+        )
+        self.assertEqual(tree_digest(self.root), before)
+        # A tarball hash that is not the SHA256SUMS line is refused.
+        self.out.write_text("", encoding="utf-8")
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.1.0"), mock.patch.object(
+            up, "fetch_mfile_sha256sums", lambda pkgver: sums
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                gate.expect_release("mfile-bin", art, main, FakeFetch())
+        self.assertIn("does not match SHA256SUMS", str(caught.exception))
+
+    def test_mfile_bump_resets_pkgrel_and_both_arch_sums(self) -> None:
+        sums = (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mfile_0.2.0_linux_amd64.tar.gz\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  mfile_0.2.0_linux_arm64.tar.gz\n"
+        )
+        main = (self.root / "mfile-bin/PKGBUILD").read_text(encoding="utf-8")
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.2.0"), mock.patch.object(
+            up, "fetch_mfile_sha256sums", lambda pkgver: sums
+        ):
+            ver, rel, text = up.expected_release_pkgbuild("mfile-bin", main)
+        self.assertEqual((ver, rel), ("0.2.0", "1"))
+        sources = gate.parse_sources("mfile-bin", text)
+        self.assertEqual(set(sources), {"source_x86_64", "source_aarch64"})
+        self.assertIn("${pkgver}", sources["source_x86_64"][0])
+        self.assertIn("linux_amd64", sources["source_x86_64"][0])
+        self.assertIn("linux_arm64", sources["source_aarch64"][0])
+        self.assertEqual(gate.parse_checksums("mfile-bin", text)["sha256sums_x86_64"], ["a" * 64])
+        self.assertEqual(gate.parse_checksums("mfile-bin", text)["sha256sums_aarch64"], ["b" * 64])
+        seen = []
+
+        def api(repo: str, prefix: str) -> str:
+            seen.append((repo, prefix))
+            return "0.2.0"
+
+        with mock.patch.object(up, "stable_github_version", api), mock.patch.object(
+            up, "fetch_mfile_sha256sums", lambda pkgver: sums
+        ):
+            up.expected_release("mfile-bin", main)
+        self.assertEqual(seen, [("DawnMagnet/mfile", "v")])
+
     def test_refuses_git_packages_and_wrong_main(self) -> None:
         art = self.artifact(f"pkgname=reflectcpp-git\npkgver=1.r0.gabcdef1\npkgrel=1\nsha256sums=('{H1}')\n")
         with self.assertRaises(SystemExit):
@@ -480,7 +542,7 @@ class SourceLockTest(unittest.TestCase):
             )
 
 
-ALL_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin", "cuda-api-wrappers-git", "reflectcpp-git")
+ALL_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin", "mfile-bin", "cuda-api-wrappers-git", "reflectcpp-git")
 
 
 def bump_ver(package: str, ver: str) -> str:
@@ -614,7 +676,7 @@ class VersionRuleTest(unittest.TestCase):
                 self.import_full(package, main, main, ver, up.read_var(main, "pkgrel"))
 
     def test_import_rejects_pkgver_99999_for_release_packages(self) -> None:
-        for package in ("moonbit-bin", "maple-mono-nf-cn", "memprocfs"):
+        for package in ("moonbit-bin", "maple-mono-nf-cn", "memprocfs", "mfile-bin"):
             main = self.real(package)
             ver, rel = up.read_var(main, "pkgver"), up.read_var(main, "pkgrel")
             with self.subTest(package=package):

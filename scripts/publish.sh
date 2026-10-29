@@ -8,7 +8,7 @@ repo="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo"
 
 case "$pkg" in
-  maple-mono-nf-cn|memprocfs|moonbit-bin|cuda-api-wrappers-git|reflectcpp-git) ;;
+  maple-mono-nf-cn|memprocfs|moonbit-bin|mfile-bin|cuda-api-wrappers-git|reflectcpp-git) ;;
   *)
     echo "refusing to publish $pkg; it is not in the AUR allowlist" >&2
     exit 1

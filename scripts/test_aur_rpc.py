@@ -64,6 +64,16 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(url, "https://aur.archlinux.org/rpc/v5/info?arg%5B%5D=moonbit-bin")
         self.assertGreater(timeout, 0)
 
+    def test_mfile_bin_does_not_match_libmfile(self) -> None:
+        body = rpc_body("mfile", "r57.a18a066-1")
+        with self.assertRaises(aur_rpc.RpcError):
+            aur_rpc.parse_response("mfile-bin", body)
+        self.assertIsNone(aur_rpc.parse_response("mfile-bin", rpc_body(None)))
+        with self.assertRaises(SystemExit) as caught:
+            aur_rpc.decide("mfile-bin", False, "0.1.0-1", None)
+        self.assertIn("no such package", str(caught.exception))
+        self.assertNotIn("r57.a18a066", str(caught.exception))
+
     def test_missing_package_is_none(self) -> None:
         opener = Opener(rpc_body(None))
         self.assertIsNone(aur_rpc.fetch_aur_version("moonbit-bin", opener=opener, sleep=no_sleep))
