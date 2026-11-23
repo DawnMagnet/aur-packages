@@ -18,13 +18,13 @@ PKGBUILDs for [DawnMagnet](https://aur.archlinux.org/packages?K=DawnMagnet&SeB=m
 
 `.github/workflows/update-aur.yml` runs:
 
-- on the schedule `0 0 */2 * *` (00:00 UTC on odd days of the month; GitHub may start the job late)
-- on `workflow_dispatch`, with boolean input `force_publish` (default false)
-- on a push to `main` that touches a package directory, `nvchecker.toml`, `scripts/`, or the workflow file
+- on the schedule `0 0 */2 * *` (00:00 UTC on odd days of the month; GitHub may start the job late), for every allowlisted package
+- on `workflow_dispatch` from `main`, with `packages` (`all` or a space-separated allowlist) and boolean `force_publish` (default false)
+- on a push to `main` that touches an allowlisted package directory. `scripts/select_packages.py` keeps only the directories that commit changed. A push of `scripts/`, `nvchecker.toml`, or the workflow file does not start this workflow; `.github/workflows/ci.yml` checks those changes.
 
-`force_publish` exists only on manual runs. When it is true, every matrix package is test-built and published even if the upstream version did not change. Schedule and push runs cannot set it. Dispatch it from `main`.
+`packages` is read as data and checked against the allowlist. An empty value, an unknown name, a duplicate, `all` mixed with names, or any other character fails the select job before a matrix exists. `force_publish` exists only on manual runs and applies only to the selected packages. Schedule and push runs cannot set it.
 
-Each package is its own matrix entry (`fail-fast: false`). Build and publish are separate jobs and share a per-package concurrency group (`aur-update-<package>`, `cancel-in-progress: false`).
+The select job has `contents: read`, no `aur` environment, and no `AUR_SSH_PRIVATE_KEY`. Build and publish use its matrix. Build still has no AUR key. Publish is still the only job in the `aur` environment. Each selected package is its own matrix entry (`fail-fast: false`). Build and publish share a per-package concurrency group (`aur-update-<package>`, `cancel-in-progress: false`).
 
 ### Build job
 
@@ -111,10 +111,10 @@ An already published PKGBUILD breaks when `latest` moves, because the checksum n
 1. Create `<name>/` with a `PKGBUILD`, `.SRCINFO` (`makepkg --printsrcinfo > .SRCINFO`), and any extra sources (`install` scripts, wrappers).
 2. Add an entry to `nvchecker.toml`. Use `source = "github"` for tags and releases. Use `source = "cmd"` when the version has to be read from an asset name or a binary, and point it at a small script under `scripts/`.
 3. Teach `scripts/update_package.py` how to rewrite that PKGBUILD, and add the name to the allowlist in `scripts/publish.sh`. Register it there too: a `-git` package needs an upstream in `GIT_REPOS`, anything else goes in `RELEASE_PACKAGES` with its host-side `expected_release_pkgbuild` logic. Import refuses any package that is in neither, so it cannot publish without the pkgver, pkgrel and source checks.
-4. Add the same matrix row to the build job and the publish job in `.github/workflows/update-aur.yml`, and include the directory in the `push` path filter.
+4. Register the name, timeout, and `free_disk` flag in `scripts/select_packages.py`, and add `<name>/**` to the `push` path filter in `.github/workflows/update-aur.yml`. The workflow builds whatever that script returns; it has no second package list.
 5. Create the package on the AUR by hand first; the workflow fails for a package the AUR RPC does not know.
-6. Push to `main`. The workflow builds and, on success, the publish job pushes to the AUR.
+6. Push to `main`. The push publishes that package directory only. A manual run with `packages=all`, or the schedule, publishes every allowlisted package.
 
-To stage a package without publishing it, commit the directory with a `.aur-disabled` file and leave it out of the matrix, `nvchecker.toml`, and the publish allowlist. `hearthstone-linux-gui-bin` and `hearthstone-linux-gui-appimage` used to be stored that way; they are published now.
+To stage a package without publishing it, commit the directory with a `.aur-disabled` file and leave it out of `scripts/select_packages.py`, `nvchecker.toml`, and the publish allowlist. `hearthstone-linux-gui-bin` and `hearthstone-linux-gui-appimage` used to be stored that way; they are published now.
 
-`asus-fa401km-acpi-fix` has no upstream version. Leave it out of `nvchecker.toml` and the matrix; edit it by hand when the DSDT override changes.
+`asus-fa401km-acpi-fix` has no upstream version. Leave it out of `nvchecker.toml` and `scripts/select_packages.py`; edit it by hand when the DSDT override changes.

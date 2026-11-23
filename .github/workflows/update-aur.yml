@@ -16,12 +16,20 @@ on:
   workflow_dispatch:
     inputs:
       force_publish:
-        description: "Test-build and publish even when the upstream version is unchanged"
+        description: "Test-build and publish the selected packages even when the upstream version is unchanged"
         type: boolean
         default: false
         required: false
+      packages:
+        description: "Allowlisted package names separated by spaces, or all. Empty, unknown, and mixed values fail closed."
+        type: string
+        default: "all"
+        required: true
   push:
     branches: [main]
+    # Package directories only. A push of scripts, nvchecker.toml, or this
+    # workflow does not start publication. select_packages.py then keeps
+    # only the allowlisted directories this commit actually changed.
     paths:
       - "maple-mono-nf-cn/**"
       - "memprocfs/**"
@@ -31,16 +39,43 @@ on:
       - "hearthstone-linux-gui-appimage/**"
       - "cuda-api-wrappers-git/**"
       - "reflectcpp-git/**"
-      - "nvchecker.toml"
-      - "scripts/**"
-      - ".github/workflows/update-aur.yml"
 
 permissions:
   contents: read
 
 jobs:
+  select:
+    name: select packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.sel.outputs.run }}
+      matrix: ${{ steps.sel.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # EVENT_NAME, BEFORE, AFTER, and PACKAGES are data. The script rejects
+      # anything that is not a known event, two commit ids, or allowlisted names.
+      - name: Select packages
+        id: sel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          PACKAGES: ${{ github.event.inputs.packages }}
+        run: python3 scripts/select_packages.py
+
   build:
     name: build ${{ matrix.package }}
+    needs: select
+    if: needs.select.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ matrix.timeout }}
     permissions:
@@ -51,32 +86,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - package: maple-mono-nf-cn
-            timeout: 45
-            free_disk: false
-          - package: memprocfs
-            timeout: 45
-            free_disk: false
-          - package: moonbit-bin
-            timeout: 60
-            free_disk: false
-          - package: mfile-bin
-            timeout: 45
-            free_disk: false
-          - package: hearthstone-linux-gui-bin
-            timeout: 60
-            free_disk: false
-          - package: hearthstone-linux-gui-appimage
-            timeout: 45
-            free_disk: false
-          - package: cuda-api-wrappers-git
-            timeout: 180
-            free_disk: true
-          - package: reflectcpp-git
-            timeout: 120
-            free_disk: false
-          # asus-fa401km-acpi-fix has no upstream version and is not updated.
+        include: ${{ fromJson(needs.select.outputs.matrix) }}
 
     steps:
       - name: Checkout latest main
@@ -178,8 +188,8 @@ jobs:
 
   publish:
     name: publish ${{ matrix.package }}
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [select, build]
+    if: needs.select.outputs.run == 'true' && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: aur
@@ -192,31 +202,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - package: maple-mono-nf-cn
-            timeout: 45
-            free_disk: false
-          - package: memprocfs
-            timeout: 45
-            free_disk: false
-          - package: moonbit-bin
-            timeout: 60
-            free_disk: false
-          - package: mfile-bin
-            timeout: 45
-            free_disk: false
-          - package: hearthstone-linux-gui-bin
-            timeout: 60
-            free_disk: false
-          - package: hearthstone-linux-gui-appimage
-            timeout: 45
-            free_disk: false
-          - package: cuda-api-wrappers-git
-            timeout: 180
-            free_disk: true
-          - package: reflectcpp-git
-            timeout: 120
-            free_disk: false
+        include: ${{ fromJson(needs.select.outputs.matrix) }}
 
     steps:
       - name: Checkout clean main

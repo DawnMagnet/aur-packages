@@ -448,27 +448,14 @@ class PublishGuardTest(unittest.TestCase):
         self.assertIn("contents: write", publish)
         self.assertIn("actions: read", publish)
         self.assertNotIn("actions/checkout@v", text)
-        self.assertEqual(text.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"), 2)
+        self.assertEqual(text.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"), 3)
         self.assertIn("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9", text)
         self.assertIn("actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333", text)
         self.assertEqual(text.count("fail-fast: false"), 2)
         self.assertEqual(text.count("cancel-in-progress: false"), 2)
         self.assertEqual(text.count("group: aur-update-${{ matrix.package }}"), 2)
         self.assertIn("force_publish", text)
-        for package in (
-            "maple-mono-nf-cn",
-            "memprocfs",
-            "moonbit-bin",
-            "mfile-bin",
-            "hearthstone-linux-gui-bin",
-            "hearthstone-linux-gui-appimage",
-            "cuda-api-wrappers-git",
-            "reflectcpp-git",
-        ):
-            self.assertEqual(text.count(f"package: {package}"), 2)
-        self.assertIn('"mfile-bin/**"', text)
-        self.assertIn('"hearthstone-linux-gui-bin/**"', text)
-        self.assertIn('"hearthstone-linux-gui-appimage/**"', text)
+        self.assertEqual(text.count("fromJson(needs.select.outputs.matrix)"), 2)
         ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/update_package.py mfile-bin", ci)
         self.assertIn("hearthstone-linux-gui-bin hearthstone-linux-gui-appimage", ci)
