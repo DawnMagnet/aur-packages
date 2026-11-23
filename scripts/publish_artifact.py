@@ -722,9 +722,9 @@ def assert_host_pkgver(
     tell two hashes of the same rN apart or stop a huge rN that would block
     every later update. For -git packages the publish job recomputes the
     pkgver from upstream (publish_artifact.py expect) and passes it in here.
-    For the release packages (maple-mono-nf-cn, memprocfs, moonbit-bin, mfile-bin) it
-    recomputes pkgver and pkgrel (publish_artifact.py expect-release) and
-    both must match exactly. A missing value fails closed for all of them.
+    For release packages (update_package.RELEASE_PACKAGES) it recomputes pkgver
+    and pkgrel (publish_artifact.py expect-release) and both must match
+    exactly. A missing value fails closed for all of them.
     Other packages are unchanged unless a value is passed.
     """
     is_git = package.endswith("-git")
@@ -845,6 +845,17 @@ def expect_release(package: str, artifact: Path, main_pkgbuild: Path, fetch=None
             die(
                 "mfile-bin: sha256 of the release tarballs does not match "
                 f"SHA256SUMS ({sums} != {pinned})"
+            )
+        sums = pinned
+    elif package in update_package.HEARTHSTONE_PACKAGES:
+        # Checksums are the SHA256SUMS.txt lines for the chosen asset. The
+        # host still hashes the downloaded bytes; a missing line or a mismatch
+        # fails closed. SKIP is not a fallback.
+        pinned = update_package.hearthstone_pinned_sha256sums(package, pkgver)
+        if sums != pinned:
+            die(
+                f"{package}: sha256 of the release asset does not match "
+                f"SHA256SUMS.txt ({sums} != {pinned})"
             )
         sums = pinned
     set_output("pkgver", pkgver)

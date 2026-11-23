@@ -7,6 +7,7 @@ import os
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import update_package as up
 
@@ -377,11 +378,7 @@ class CiShouldBuildTest(unittest.TestCase):
 
 class PublishGuardTest(unittest.TestCase):
     def test_publish_refuses_packages_outside_the_allowlist(self) -> None:
-        for name in (
-            "hearthstone-linux-gui-bin",
-            "hearthstone-linux-gui-appimage",
-            "not-a-package",
-        ):
+        for name in ("not-a-package", "asus-fa401km-acpi-fix", "hearthstone-linux-gui"):
             env = os.environ.copy()
             env.pop("AUR_SSH_PRIVATE_KEY", None)
             proc = subprocess.run(
@@ -395,23 +392,28 @@ class PublishGuardTest(unittest.TestCase):
             self.assertIn("allowlist", proc.stderr)
             self.assertNotIn("PRIVATE KEY", proc.stderr + proc.stdout)
 
-    def test_disabled_package_is_refused_before_docker(self) -> None:
-        proc = subprocess.run(
-            ["bash", str(ROOT / "scripts/test_build.sh"), "hearthstone-linux-gui-bin"],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("disabled", proc.stderr)
-        proc = subprocess.run(
-            ["bash", str(ROOT / "scripts/test_build.sh"), "hearthstone-linux-gui-appimage"],
-            check=False,
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("disabled", proc.stderr)
+    def test_hearthstone_is_allowlisted_and_stops_before_using_a_key(self) -> None:
+        env = os.environ.copy()
+        env.pop("AUR_SSH_PRIVATE_KEY", None)
+        for name in ("hearthstone-linux-gui-bin", "hearthstone-linux-gui-appimage"):
+            self.assertFalse((ROOT / name / ".aur-disabled").is_file(), name)
+            proc = subprocess.run(
+                ["bash", str(ROOT / "scripts/publish.sh"), name],
+                check=False,
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("AUR_SSH_PRIVATE_KEY is empty", proc.stderr)
+            self.assertNotIn("allowlist", proc.stderr)
+            self.assertNotIn("disabled", proc.stderr)
+            self.assertNotIn("PRIVATE KEY", proc.stdout)
+            self.assertNotIn("BEGIN ", proc.stderr + proc.stdout)
+
+    def test_disabled_marker_still_blocks_build_and_publish(self) -> None:
+        for rel in ("scripts/publish.sh", "scripts/test_build.sh", "scripts/build_in_arch.sh"):
+            self.assertIn(".aur-disabled", (ROOT / rel).read_text(encoding="utf-8"))
 
     def test_test_build_seals_before_a_second_container(self) -> None:
         text = (ROOT / "scripts/test_build.sh").read_text(encoding="utf-8")
@@ -446,24 +448,20 @@ class PublishGuardTest(unittest.TestCase):
         self.assertIn("contents: write", publish)
         self.assertIn("actions: read", publish)
         self.assertNotIn("actions/checkout@v", text)
-        self.assertEqual(text.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"), 2)
+        self.assertEqual(text.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"), 3)
         self.assertIn("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9", text)
         self.assertIn("actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333", text)
         self.assertEqual(text.count("fail-fast: false"), 2)
         self.assertEqual(text.count("cancel-in-progress: false"), 2)
         self.assertEqual(text.count("group: aur-update-${{ matrix.package }}"), 2)
         self.assertIn("force_publish", text)
-        self.assertNotIn("package: hearthstone", text)
-        for package in (
-            "maple-mono-nf-cn",
-            "memprocfs",
-            "moonbit-bin",
-            "mfile-bin",
-            "cuda-api-wrappers-git",
-            "reflectcpp-git",
-        ):
-            self.assertEqual(text.count(f"package: {package}"), 2)
-        self.assertIn('"mfile-bin/**"', text)
+        self.assertEqual(text.count("fromJson(needs.select.outputs.matrix)"), 2)
+        ci = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/update_package.py mfile-bin", ci)
+        self.assertIn("hearthstone-linux-gui-bin hearthstone-linux-gui-appimage", ci)
+        self.assertNotIn("update_package.py maple", ci)
+        self.assertNotIn("update_package.py moonbit", ci)
+        self.assertNotIn("update_package.py memprocfs", ci)
         dependabot = (ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
         self.assertIn("package-ecosystem: github-actions", dependabot)
         self.assertIn("interval: weekly", dependabot)
@@ -475,6 +473,287 @@ class PublishGuardTest(unittest.TestCase):
         self.assertIn("\tconflicts = moon-bin\n", srcinfo)
         rel = up.read_var(pkgbuild, "pkgrel")
         self.assertIn(f"\tpkgrel = {rel}\n", srcinfo)
+
+
+V041_ASSETS = [
+    "hearthstone-linux-gui-0.4.1-1-x86_64.pkg.tar.zst",
+    "hearthstone-linux-gui-0.4.1-1.x86_64.rpm",
+    "hearthstone-linux-gui-0.4.1-x86_64.AppImage",
+    "hearthstone-linux-gui-0.4.1-x86_64.flatpak",
+    "hearthstone-linux-gui_0.4.1_amd64.deb",
+    "SHA256SUMS.txt",
+]
+V041_SUMS = """\
+be31ec0b988a062481d47d33064005852ef6322516d3dcf523417539f8003543  hearthstone-linux-gui-0.4.1-1-x86_64.pkg.tar.zst
+e00ef9061c1310515fc45d9d23cf63de70858800cde058e7119a08ea4a0ed904  hearthstone-linux-gui-0.4.1-1.x86_64.rpm
+0db2b769530095ba7811888e03b10eb7581553ad31cc97ec3d495279e4cce43d  hearthstone-linux-gui-0.4.1-x86_64.AppImage
+21108142cf6eea1cc61b5fc4487fdf27a9b8f2bac5ee8e99470f40e1dd354f96  hearthstone-linux-gui-0.4.1-x86_64.flatpak
+6fa062256cbacab5fa7735a0ed94c53b3df550c82e617bc4d17b4f9e8d9f53a8  hearthstone-linux-gui_0.4.1_amd64.deb
+4b19fc174b0e5778ab1dd5d697094fdec4c79af97010e44e362db9bc46a91392  provenance.json
+"""
+BIN_URL = (
+    "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.4.1/"
+    "hearthstone-linux-gui-0.4.1-1-x86_64.pkg.tar.zst"
+)
+APP_URL = (
+    "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.4.1/"
+    "hearthstone-linux-gui-0.4.1-x86_64.AppImage"
+)
+
+
+def _pkgbuild(name: str, ver: str = "0.3.2", rel: str = "4", source: str | None = None, digest: str | None = None) -> str:
+    source = source or "https://example.invalid/old"
+    digest = digest or "c" * 64
+    return (
+        f"pkgname={name}\n"
+        f"pkgver={ver}\n"
+        f"pkgrel={rel}\n"
+        f'source=("{source}")\n'
+        f"sha256sums=('{digest}')\n"
+    )
+
+
+class HearthstoneUpdateTest(unittest.TestCase):
+    def test_v041_assets_ignore_rpm_and_use_real_checksums(self) -> None:
+        info = up.resolve_hearthstone_assets("0.4.1", V041_ASSETS, V041_SUMS)
+        self.assertEqual(info["bin_rel"], "1")
+        self.assertEqual(info["bin_url"], BIN_URL)
+        self.assertEqual(info["appimage_url"], APP_URL)
+        self.assertEqual(info["bin_sha256"], "be31ec0b988a062481d47d33064005852ef6322516d3dcf523417539f8003543")
+        self.assertEqual(info["appimage_sha256"], "0db2b769530095ba7811888e03b10eb7581553ad31cc97ec3d495279e4cce43d")
+        self.assertNotIn("SKIP", info["bin_sha256"] + info["appimage_sha256"])
+
+    def test_committed_pkgbuilds_match_the_v041_release(self) -> None:
+        info = up.resolve_hearthstone_assets("0.4.1", V041_ASSETS, V041_SUMS)
+        pairs = (
+            ("hearthstone-linux-gui-bin", info["bin_url"], info["bin_sha256"], "hearthstone-linux-gui-appimage"),
+            ("hearthstone-linux-gui-appimage", info["appimage_url"], info["appimage_sha256"], "hearthstone-linux-gui-bin"),
+        )
+        for name, url, digest, other in pairs:
+            text = (ROOT / name / "PKGBUILD").read_text(encoding="utf-8")
+            srcinfo = (ROOT / name / ".SRCINFO").read_text(encoding="utf-8")
+            self.assertEqual(up.read_var(text, "pkgver"), "0.4.1")
+            self.assertEqual(up.read_var(text, "pkgrel"), "1")
+            self.assertIn(f'source=("{url}")', text)
+            self.assertIn(f"sha256sums=('{digest}')", text)
+            self.assertNotIn("SKIP", text)
+            self.assertIn("provides=('hearthstone-linux-gui')", text)
+            self.assertIn(f"conflicts=('hearthstone-linux-gui' '{other}')", text)
+            self.assertNotIn(f"conflicts=('{name}'", text)
+            self.assertIn(f"\tpkgver = 0.4.1\n", srcinfo)
+            self.assertIn(f"\tsha256sums = {digest}\n", srcinfo)
+            self.assertIn("\tprovides = hearthstone-linux-gui\n", srcinfo)
+            self.assertIn(f"\tconflicts = {other}\n", srcinfo)
+            self.assertFalse((ROOT / name / ".aur-disabled").exists())
+        bin_text = (ROOT / "hearthstone-linux-gui-bin/PKGBUILD").read_text(encoding="utf-8")
+        app_text = (ROOT / "hearthstone-linux-gui-appimage/PKGBUILD").read_text(encoding="utf-8")
+        bin_depends = up.read_var(bin_text, "depends")
+        app_depends = up.read_var(app_text, "depends")
+        for dep in ("glibc", "gtk4", "libadwaita", "glib2", "pango", "xdg-utils", "gdk-pixbuf2", "xz", "hicolor-icon-theme"):
+            self.assertIn(dep, bin_depends)
+        self.assertNotIn("gtk4", app_depends)
+        for dep in ("glibc", "fuse2", "hicolor-icon-theme", "xdg-utils"):
+            self.assertIn(dep, app_depends)
+        self.assertIn("/usr/bin/hearthstone-linux-gui", app_text)
+        self.assertIn("io.github.hearthstone_linux_gui.desktop", app_text)
+        self.assertIn('bsdtar -xf "${archives[0]}" -C "${pkgdir}"', bin_text)
+        self.assertIn("/usr/share/licenses/${pkgname}/LICENSE", bin_text)
+        self.assertIn("/usr/share/licenses/${pkgname}/LICENSE", app_text)
+        allow = (ROOT / "scripts/aur_rpc.py").read_text(encoding="utf-8")
+        self.assertIn('FIRST_PUBLISH_ALLOWLIST = ("mfile-bin",)', allow)
+        self.assertNotIn("hearthstone", allow.split("FIRST_PUBLISH_ALLOWLIST", 1)[1].split("\n", 1)[0])
+
+    def test_nvchecker_entries_match_the_asset_repo(self) -> None:
+        for name in up.HEARTHSTONE_PACKAGES:
+            entry = up.load_nv_entry(name)
+            self.assertEqual(entry["source"], "github")
+            self.assertEqual(entry["github"], up.HEARTHSTONE_REPO)
+            self.assertTrue(entry["use_latest_release"])
+            self.assertEqual(entry["prefix"], "v")
+            self.assertIn(name, up.RELEASE_PACKAGES)
+            self.assertIn(name, up.UPDATERS)
+
+    def test_upstream_pkgrel_is_not_assumed_to_be_1(self) -> None:
+        names = [
+            "hearthstone-linux-gui-1.2.3-2-x86_64.pkg.tar.zst",
+            "hearthstone-linux-gui-1.2.3-10-x86_64.pkg.tar.zst",
+            "hearthstone-linux-gui-1.2.3-1.x86_64.rpm",
+            "hearthstone-linux-gui-1.2.3-1-x86_64-native.pkg.tar.zst",
+            "hearthstone-linux-gui-1.2.3-4-x86_64.AppImage",
+            "SHA256SUMS.txt",
+        ]
+        sums = (
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  hearthstone-linux-gui-1.2.3-2-x86_64.pkg.tar.zst\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  hearthstone-linux-gui-1.2.3-10-x86_64.pkg.tar.zst\n"
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  hearthstone-linux-gui-1.2.3-4-x86_64.AppImage\n"
+        )
+        info = up.resolve_hearthstone_assets("1.2.3", names, sums)
+        self.assertEqual(info["bin_rel"], "10")
+        self.assertTrue(info["bin_url"].endswith("hearthstone-linux-gui-1.2.3-10-x86_64.pkg.tar.zst"))
+        self.assertTrue(info["appimage_url"].endswith("hearthstone-linux-gui-1.2.3-4-x86_64.AppImage"))
+        self.assertNotIn("-1-x86_64.pkg.tar.zst", info["bin_url"])
+
+    def test_plain_and_qualified_appimage_together_is_refused(self) -> None:
+        names = [
+            "hearthstone-linux-gui-1.0.0-1-x86_64.pkg.tar.zst",
+            "hearthstone-linux-gui-1.0.0-x86_64.AppImage",
+            "hearthstone-linux-gui-1.0.0-2-x86_64.AppImage",
+            "SHA256SUMS.txt",
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            up.resolve_hearthstone_assets("1.0.0", names, "aa" * 32 + "  hearthstone-linux-gui-1.0.0-1-x86_64.pkg.tar.zst\n")
+        self.assertIn("refusing to guess", str(caught.exception))
+
+    def test_missing_asset_checksum_or_sums_file_fails(self) -> None:
+        names = [
+            "hearthstone-linux-gui-1.0.0-3-x86_64.pkg.tar.zst",
+            "hearthstone-linux-gui-1.0.0-x86_64.AppImage",
+            "SHA256SUMS.txt",
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            up.resolve_hearthstone_assets("1.0.0", names, "not a checksum\n")
+        self.assertIn("malformed", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            up.resolve_hearthstone_assets(
+                "1.0.0",
+                names,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  hearthstone-linux-gui-1.0.0-3-x86_64.pkg.tar.zst\n",
+            )
+        self.assertIn("missing", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            up.resolve_hearthstone_assets("1.0.0", names[:-1], "x\n")
+        self.assertIn("no SHA256SUMS.txt", str(caught.exception))
+        native_only = ["hearthstone-linux-gui-1.0.0-1-x86_64-native.pkg.tar.zst", "SHA256SUMS.txt"]
+        with self.assertRaises(SystemExit) as caught:
+            up.resolve_hearthstone_assets("1.0.0", native_only, "x\n")
+        self.assertIn("no Arch package asset", str(caught.exception))
+        with self.assertRaises(SystemExit) as caught:
+            up.parse_hearthstone_sha256sums("SKIP  hearthstone-linux-gui-1.0.0-x86_64.AppImage\n")
+        self.assertIn("malformed", str(caught.exception))
+
+    def test_release_fetch_uses_the_canonical_sums_url(self) -> None:
+        rel = {
+            "tag_name": "v0.4.1",
+            "draft": False,
+            "prerelease": False,
+            "assets": [{"name": name} for name in V041_ASSETS],
+        }
+        seen: dict[str, str] = {}
+
+        def api(url: str):
+            seen["api"] = url
+            return rel
+
+        def download(url: str, *, limit: int = 0) -> str:
+            seen["sums"] = url
+            seen["limit"] = str(limit)
+            return V041_SUMS
+
+        with mock.patch.object(up, "github_api", api), mock.patch.object(up, "download_release_text", download):
+            info = up.hearthstone_release("0.4.1")
+        self.assertEqual(seen["api"], "https://api.github.com/repos/DawnMagnet/hearthstone-linux-gui/releases/tags/v0.4.1")
+        self.assertEqual(
+            seen["sums"],
+            "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.4.1/SHA256SUMS.txt",
+        )
+        self.assertEqual(info["bin_url"], BIN_URL)
+        prerelease = dict(rel, prerelease=True)
+        with mock.patch.object(up, "github_api", lambda url: prerelease):
+            with self.assertRaises(SystemExit) as caught:
+                up.github_release_by_tag(up.HEARTHSTONE_REPO, "0.4.1")
+        self.assertIn("prerelease", str(caught.exception))
+
+    def test_bump_resets_pkgrel_and_records_the_real_asset_rel(self) -> None:
+        import tempfile
+
+        info = up.resolve_hearthstone_assets(
+            "0.4.1",
+            [
+                "hearthstone-linux-gui-0.4.1-7-x86_64.pkg.tar.zst",
+                "hearthstone-linux-gui-0.4.1-x86_64.AppImage",
+                "SHA256SUMS.txt",
+            ],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  hearthstone-linux-gui-0.4.1-7-x86_64.pkg.tar.zst\n"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  hearthstone-linux-gui-0.4.1-x86_64.AppImage\n",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up.ROOT = root
+            self.addCleanup(setattr, up, "ROOT", ROOT)
+            for name, url_key, sum_key in (
+                ("hearthstone-linux-gui-bin", "bin_url", "bin_sha256"),
+                ("hearthstone-linux-gui-appimage", "appimage_url", "appimage_sha256"),
+            ):
+                pkg = root / name
+                pkg.mkdir()
+                (pkg / "PKGBUILD").write_text(_pkgbuild(name), encoding="utf-8")
+            self._patch("choose_release_version", lambda package: "0.4.1")
+            self._patch("hearthstone_release", lambda pkgver: info)
+            up.update_hearthstone("hearthstone-linux-gui-bin")
+            text = (root / "hearthstone-linux-gui-bin/PKGBUILD").read_text(encoding="utf-8")
+            self.assertEqual(up.read_var(text, "pkgver"), "0.4.1")
+            self.assertEqual(up.read_var(text, "pkgrel"), "1")
+            self.assertIn(f'source=("{info["bin_url"]}")', text)
+            self.assertIn("-7-x86_64.pkg.tar.zst", text)
+            self.assertNotIn("-1-x86_64.pkg.tar.zst", text)
+            self.assertIn(f"sha256sums=('{info['bin_sha256']}')", text)
+            self.assertNotIn("SKIP", text)
+            self.assertEqual((root / "hearthstone-linux-gui-bin/.update-old-version").read_text(encoding="utf-8").strip(), "0.3.2-4")
+
+    def test_same_version_drift_does_not_rewrite(self) -> None:
+        import tempfile
+
+        info = {
+            "pkgver": "0.4.1",
+            "bin_url": BIN_URL.replace("-1-x86_64", "-2-x86_64"),
+            "bin_sha256": "a" * 64,
+            "appimage_url": APP_URL,
+            "appimage_sha256": "b" * 64,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up.ROOT = root
+            self.addCleanup(setattr, up, "ROOT", ROOT)
+            pkg = root / "hearthstone-linux-gui-bin"
+            pkg.mkdir()
+            original = (ROOT / "hearthstone-linux-gui-bin/PKGBUILD").read_text(encoding="utf-8")
+            (pkg / "PKGBUILD").write_text(original, encoding="utf-8")
+            self._patch("choose_release_version", lambda package: "0.4.1")
+            self._patch("hearthstone_release", lambda pkgver: info)
+            with self.assertRaises(SystemExit) as caught:
+                up.update_hearthstone("hearthstone-linux-gui-bin")
+            self.assertIn("does not match", str(caught.exception))
+            self.assertEqual((pkg / "PKGBUILD").read_text(encoding="utf-8"), original)
+            self.assertFalse((pkg / ".update-old-version").exists())
+
+    def test_current_release_does_not_rewrite_and_downgrade_is_refused(self) -> None:
+        import tempfile
+
+        info = up.resolve_hearthstone_assets("0.4.1", V041_ASSETS, V041_SUMS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            up.ROOT = root
+            self.addCleanup(setattr, up, "ROOT", ROOT)
+            pkg = root / "hearthstone-linux-gui-appimage"
+            pkg.mkdir()
+            original = (ROOT / "hearthstone-linux-gui-appimage/PKGBUILD").read_text(encoding="utf-8")
+            (pkg / "PKGBUILD").write_text(original, encoding="utf-8")
+            self._patch("choose_release_version", lambda package: "0.4.1")
+            self._patch("hearthstone_release", lambda pkgver: info)
+            up.update_hearthstone("hearthstone-linux-gui-appimage")
+            self.assertEqual((pkg / "PKGBUILD").read_text(encoding="utf-8"), original)
+            (pkg / "PKGBUILD").write_text(
+                _pkgbuild("hearthstone-linux-gui-appimage", ver="9.0.0", rel="1", source=APP_URL, digest=info["appimage_sha256"]),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit) as caught:
+                up.update_hearthstone("hearthstone-linux-gui-appimage")
+            self.assertIn("downgrade", str(caught.exception))
+
+    def _patch(self, name: str, value: object) -> None:
+        original = getattr(up, name)
+        setattr(up, name, value)
+        self.addCleanup(setattr, up, name, original)
 
 
 if __name__ == "__main__":
