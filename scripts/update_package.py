@@ -2,11 +2,14 @@
 """Update one package directory to the current upstream version.
 
 The script reads nvchecker.toml for GitHub coordinates, then rewrites pkgver,
-pkgrel, and (for memprocfs) source URLs. A pkgver bump resets pkgrel to 1.
-memprocfs does not: its pkgrel is the upstream asset date. Checksums for
-non-VCS packages are filled afterwards by updpkgsums inside the Arch test
-build. A package is left untouched when the upstream version is not strictly
-newer.
+pkgrel, and (for memprocfs, mfile-bin and the hearthstone packages) source
+URLs. A pkgver bump resets pkgrel to 1. memprocfs does not: its pkgrel is the
+upstream asset date. mfile-bin and the hearthstone packages take sha256sums
+from the release checksum file and never write SKIP. updpkgsums inside the
+Arch test build recomputes those checksums; the publish host requires them to
+match the release file. A package is left untouched when the upstream version
+is not strictly newer. The same version with a different source URL or
+checksum fails closed.
 """
 
 from __future__ import annotations
@@ -591,6 +594,259 @@ def update_mfile() -> None:
     mark_changed("mfile-bin", old_full, new_full)
 
 
+# Two AUR packages from one GitHub release of hearthstone-linux-gui.
+# The Arch asset is hearthstone-linux-gui-<ver>-<upstream pkgrel>-x86_64.pkg.tar.zst.
+# The AppImage is hearthstone-linux-gui-<ver>-x86_64.AppImage (no pkgrel today).
+# Upstream's pkgrel is part of the asset name, not this repo's pkgrel, and is
+# never assumed to be 1. sha256sums are the SHA256SUMS.txt lines for the
+# assets actually chosen. A missing release, asset, or checksum fails closed.
+HEARTHSTONE_REPO = "DawnMagnet/hearthstone-linux-gui"
+HEARTHSTONE_PACKAGES = ("hearthstone-linux-gui-bin", "hearthstone-linux-gui-appimage")
+HEARTHSTONE_PKGVER_RE = re.compile(r"[0-9A-Za-z.][0-9A-Za-z._]*")
+HEARTHSTONE_ASSET_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+HEARTHSTONE_UPSTREAM_REL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+def _hearthstone_pkgver(pkgver: str) -> str:
+    if not HEARTHSTONE_PKGVER_RE.fullmatch(pkgver):
+        raise SystemExit(f"refusing hearthstone pkgver {pkgver!r}")
+    return pkgver
+
+
+def hearthstone_download_url(pkgver: str, asset: str) -> str:
+    """Canonical GitHub release URL. The asset name is not taken from a redirect."""
+    pkgver = _hearthstone_pkgver(pkgver)
+    if not HEARTHSTONE_ASSET_RE.fullmatch(asset):
+        raise SystemExit(f"refusing hearthstone asset name {asset!r}")
+    url = f"https://github.com/{HEARTHSTONE_REPO}/releases/download/v{pkgver}/{asset}"
+    if not re.fullmatch(r"https://[A-Za-z0-9._~:/?#@%+=-]{1,2000}", url):
+        raise SystemExit(f"refusing hearthstone asset URL {url!r}")
+    return url
+
+
+def parse_hearthstone_sha256sums(text: str) -> dict[str, str]:
+    """Parse SHA256SUMS.txt. Extra assets are kept. Malformed lines fail."""
+    if not text or not text.strip():
+        raise SystemExit("SHA256SUMS.txt is empty")
+    found: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = SHA256SUMS_LINE.fullmatch(line)
+        if match is None:
+            raise SystemExit(f"malformed SHA256SUMS.txt line: {line!r}")
+        digest, name = match.group(1), match.group(2)
+        if not HEARTHSTONE_ASSET_RE.fullmatch(name):
+            raise SystemExit(f"refusing SHA256SUMS.txt name {name!r}")
+        if name in found:
+            raise SystemExit(f"duplicate SHA256SUMS.txt entry {name}")
+        found[name] = digest
+    if not found:
+        raise SystemExit("SHA256SUMS.txt has no entries")
+    return found
+
+
+def _highest_upstream_rel(matches: list[tuple[str, str]], pkgver: str, kind: str) -> tuple[str, str]:
+    """Return (asset name, rel) with the greatest upstream pkgrel. Ties fail."""
+    if not matches:
+        raise SystemExit(f"release v{pkgver} has no {kind} asset")
+    best_rel, best_name = matches[0]
+    if not HEARTHSTONE_UPSTREAM_REL_RE.fullmatch(best_rel):
+        raise SystemExit(f"refusing upstream pkgrel {best_rel!r} in {best_name}")
+    for rel, name in matches[1:]:
+        if not HEARTHSTONE_UPSTREAM_REL_RE.fullmatch(rel):
+            raise SystemExit(f"refusing upstream pkgrel {rel!r} in {name}")
+        cmp = vercmp(rel, best_rel)
+        if cmp == 0 and name != best_name:
+            raise SystemExit(f"ambiguous {kind} assets for v{pkgver}: {best_name} and {name}")
+        if cmp > 0:
+            best_rel, best_name = rel, name
+    return best_name, best_rel
+
+
+def select_hearthstone_bin_asset(pkgver: str, names: list[str]) -> tuple[str, str]:
+    """Arch package asset and the pkgrel embedded in its filename.
+
+    Matches hearthstone-linux-gui-<pkgver>-<pkgrel>-x86_64.pkg.tar.zst only.
+    An rpm, a `-native` suffix, or a name with no pkgrel does not match.
+    When several pkgrels exist, the greatest one is used. 1 is not a default.
+    """
+    pkgver = _hearthstone_pkgver(pkgver)
+    pattern = re.compile(
+        rf"^hearthstone-linux-gui-{re.escape(pkgver)}-([0-9]+(?:\.[0-9]+)?)-x86_64\.pkg\.tar\.zst$"
+    )
+    matches = [(m.group(1), name) for name in names if (m := pattern.fullmatch(name))]
+    return _highest_upstream_rel(matches, pkgver, "Arch package")
+
+
+def select_hearthstone_appimage_asset(pkgver: str, names: list[str]) -> str:
+    """AppImage asset. Today's names have no pkgrel.
+
+    The plain hearthstone-linux-gui-<pkgver>-x86_64.AppImage wins when it is
+    the only shape. A pkgrel-qualified name is accepted only when the plain
+    name is absent (greatest pkgrel). Both shapes together is ambiguous.
+    """
+    pkgver = _hearthstone_pkgver(pkgver)
+    plain = f"hearthstone-linux-gui-{pkgver}-x86_64.AppImage"
+    pattern = re.compile(
+        rf"^hearthstone-linux-gui-{re.escape(pkgver)}-([0-9]+(?:\.[0-9]+)?)-x86_64\.AppImage$"
+    )
+    qualified = [(m.group(1), name) for name in names if (m := pattern.fullmatch(name))]
+    if plain in names and qualified:
+        raise SystemExit(
+            f"release v{pkgver} has both {plain} and a pkgrel-qualified AppImage; "
+            "refusing to guess"
+        )
+    if plain in names:
+        return plain
+    name, _rel = _highest_upstream_rel(qualified, pkgver, "AppImage")
+    return name
+
+
+def resolve_hearthstone_assets(pkgver: str, asset_names: list[str], sums_text: str) -> dict:
+    """Choose the Arch package and AppImage and pin sha256 from SHA256SUMS.txt.
+
+    Checksums are never invented. A missing asset or checksum line fails.
+    """
+    pkgver = _hearthstone_pkgver(pkgver)
+    if not isinstance(asset_names, list) or not asset_names:
+        raise SystemExit(f"release v{pkgver} has no assets")
+    names: list[str] = []
+    for name in asset_names:
+        if not isinstance(name, str) or not HEARTHSTONE_ASSET_RE.fullmatch(name):
+            raise SystemExit(f"refusing release asset name {name!r}")
+        if name in names:
+            raise SystemExit(f"duplicate release asset {name}")
+        names.append(name)
+    if "SHA256SUMS.txt" not in names:
+        raise SystemExit(f"release v{pkgver} has no SHA256SUMS.txt asset")
+    bin_name, bin_rel = select_hearthstone_bin_asset(pkgver, names)
+    app_name = select_hearthstone_appimage_asset(pkgver, names)
+    sums = parse_hearthstone_sha256sums(sums_text)
+    missing = [asset for asset in (bin_name, app_name) if asset not in sums]
+    if missing:
+        raise SystemExit(f"SHA256SUMS.txt for v{pkgver} is missing {', '.join(missing)}")
+    return {
+        "pkgver": pkgver,
+        "bin_asset": bin_name,
+        "bin_rel": bin_rel,
+        "bin_url": hearthstone_download_url(pkgver, bin_name),
+        "bin_sha256": sums[bin_name],
+        "appimage_asset": app_name,
+        "appimage_url": hearthstone_download_url(pkgver, app_name),
+        "appimage_sha256": sums[app_name],
+    }
+
+
+def github_release_by_tag(repo: str, pkgver: str) -> dict:
+    pkgver = _hearthstone_pkgver(pkgver)
+    if repo != HEARTHSTONE_REPO:
+        raise SystemExit(f"refusing hearthstone repo {repo!r}")
+    url = f"https://api.github.com/repos/{repo}/releases/tags/v{pkgver}"
+    try:
+        rel = github_api(url)
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"GitHub release v{pkgver} for {repo} failed: HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"GitHub release v{pkgver} for {repo} failed: {exc}") from exc
+    if not isinstance(rel, dict):
+        raise SystemExit(f"GitHub release v{pkgver} response is not an object")
+    if rel.get("draft") or rel.get("prerelease"):
+        raise SystemExit(f"refusing draft or prerelease v{pkgver}")
+    if rel.get("tag_name") != f"v{pkgver}":
+        raise SystemExit(f"release tag {rel.get('tag_name')!r} is not v{pkgver}")
+    return rel
+
+
+def release_asset_names(rel: dict) -> list[str]:
+    assets = rel.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise SystemExit("release has no assets")
+    names: list[str] = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            raise SystemExit("malformed release asset")
+        name = asset.get("name")
+        if not isinstance(name, str) or not HEARTHSTONE_ASSET_RE.fullmatch(name):
+            raise SystemExit(f"refusing release asset name {name!r}")
+        if name in names:
+            raise SystemExit(f"duplicate release asset {name}")
+        names.append(name)
+    return names
+
+
+def hearthstone_release(pkgver: str) -> dict:
+    """Resolve tag v<pkgver> from the asset list and SHA256SUMS.txt."""
+    pkgver = _hearthstone_pkgver(pkgver)
+    rel = github_release_by_tag(HEARTHSTONE_REPO, pkgver)
+    names = release_asset_names(rel)
+    if "SHA256SUMS.txt" not in names:
+        raise SystemExit(f"release v{pkgver} has no SHA256SUMS.txt asset")
+    # The URL is the canonical download. browser_download_url is not followed.
+    sums_text = download_release_text(hearthstone_download_url(pkgver, "SHA256SUMS.txt"), limit=64 * 1024)
+    return resolve_hearthstone_assets(pkgver, names, sums_text)
+
+
+def apply_hearthstone_sources_and_sums(package: str, text: str, info: dict) -> str:
+    """Rewrite the single source URL and its sha256sums entry. Never writes SKIP."""
+    if package == "hearthstone-linux-gui-bin":
+        url, digest = info["bin_url"], info["bin_sha256"]
+    elif package == "hearthstone-linux-gui-appimage":
+        url, digest = info["appimage_url"], info["appimage_sha256"]
+    else:
+        raise SystemExit(f"{package} is not a hearthstone package")
+    if not re.fullmatch(r"https://[A-Za-z0-9._~:/?#@%+=-]{1,2000}", url):
+        raise SystemExit(f"refusing source URL {url!r}")
+    text = set_quoted_array(text, "source", url)
+    text = set_sha256sum(text, "sha256sums", digest)
+    sum_line = next(line for line in text.splitlines() if line.startswith("sha256sums="))
+    if "SKIP" in sum_line:
+        raise SystemExit(f"{package}: refusing to write SKIP checksums")
+    return text
+
+
+def hearthstone_pinned_sha256sums(
+    package: str, pkgver: str, info: dict | None = None
+) -> dict[str, list[str]]:
+    """sha256sums for the one asset this package publishes, from SHA256SUMS.txt."""
+    if package not in HEARTHSTONE_PACKAGES:
+        raise SystemExit(f"{package} is not a hearthstone package")
+    resolved = hearthstone_release(pkgver) if info is None else info
+    if resolved.get("pkgver") not in (None, pkgver):
+        raise SystemExit(f"{package}: checksum pin is for {resolved.get('pkgver')}, not {pkgver}")
+    digest = resolved["bin_sha256"] if package == "hearthstone-linux-gui-bin" else resolved["appimage_sha256"]
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"{package}: refusing checksum pin")
+    return {"sha256sums": [digest]}
+
+
+def update_hearthstone(package: str) -> None:
+    # nvchecker.toml is a github release entry (DawnMagnet/hearthstone-linux-gui, prefix v).
+    if package not in HEARTHSTONE_PACKAGES:
+        raise SystemExit(f"{package} is not a hearthstone package")
+    text = read_pkgbuild(package)
+    old_ver = read_var(text, "pkgver")
+    old_rel = read_var(text, "pkgrel")
+    new_ver = choose_release_version(package)
+    info = hearthstone_release(new_ver)
+    old_full = full_version(old_ver, old_rel)
+    refreshed = apply_hearthstone_sources_and_sums(package, text, info)
+    if new_ver == old_ver:
+        if refreshed != text:
+            raise SystemExit(
+                f"{package} is at v{new_ver} but its source URL or sha256sums does not "
+                "match the release asset and SHA256SUMS.txt"
+            )
+        mark_unchanged(package, old_full)
+        return
+    new_full = full_version(new_ver, "1")
+    require_newer(package, old_full, new_full)
+    text = bump_pkgver(refreshed, new_ver)
+    write_pkgbuild(package, text)
+    mark_changed(package, old_full, new_full)
+
+
 def update_moonbit() -> None:
     # nvchecker.toml runs scripts/nvchecker_moonbit.py, which calls this probe.
     info = probe_moonbit()
@@ -610,7 +866,14 @@ def update_moonbit() -> None:
     mark_changed("moonbit-bin", old_full, new_full)
 
 
-RELEASE_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin", "mfile-bin")
+RELEASE_PACKAGES = (
+    "maple-mono-nf-cn",
+    "memprocfs",
+    "moonbit-bin",
+    "mfile-bin",
+    "hearthstone-linux-gui-bin",
+    "hearthstone-linux-gui-appimage",
+)
 PKGREL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?")
 
 
@@ -656,6 +919,12 @@ def expected_release_pkgbuild(pkg: str, main_pkgbuild: str) -> tuple[str, str, s
         # Both source_<arch> arrays and both sha256sums_<arch> arrays. The
         # digests are the release SHA256SUMS lines. Source URLs keep ${pkgver}.
         text = apply_mfile_sources_and_sums(text, pkgver, fetch_mfile_sha256sums(pkgver))
+    elif pkg in HEARTHSTONE_PACKAGES:
+        pkgver = choose_release_version(pkg, use_nvchecker=False)
+        pkgrel = main_rel if pkgver == main_ver else "1"
+        # Concrete https URL (version and upstream asset pkgrel baked in) and
+        # the SHA256SUMS.txt digest. Our pkgrel is not the asset's pkgrel.
+        text = apply_hearthstone_sources_and_sums(pkg, text, hearthstone_release(pkgver))
     else:
         raise SystemExit(f"{pkg} is not a release package")
     if not PKGVER_RE.fullmatch(pkgver) or not PKGREL_RE.fullmatch(pkgrel):
@@ -803,6 +1072,8 @@ UPDATERS = {
     "memprocfs": update_memprocfs,
     "moonbit-bin": update_moonbit,
     "mfile-bin": update_mfile,
+    "hearthstone-linux-gui-bin": lambda: update_hearthstone("hearthstone-linux-gui-bin"),
+    "hearthstone-linux-gui-appimage": lambda: update_hearthstone("hearthstone-linux-gui-appimage"),
     "cuda-api-wrappers-git": lambda: update_git(
         "cuda-api-wrappers-git", GIT_REPOS["cuda-api-wrappers-git"]
     ),
@@ -826,6 +1097,22 @@ def self_check() -> None:
         raise SystemExit("self-check: abbreviated git pkgvers of one commit differed")
     if same_pkgver_commit("0.8.2.r0.gabcdef1", "0.8.2.r1.gabcdef12"):
         raise SystemExit("self-check: different git revisions compared equal")
+    sample = resolve_hearthstone_assets(
+        "9.9.9",
+        [
+            "hearthstone-linux-gui-9.9.9-7-x86_64.pkg.tar.zst",
+            "hearthstone-linux-gui-9.9.9-x86_64.AppImage",
+            "SHA256SUMS.txt",
+        ],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  "
+        "hearthstone-linux-gui-9.9.9-7-x86_64.pkg.tar.zst\n"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  "
+        "hearthstone-linux-gui-9.9.9-x86_64.AppImage\n",
+    )
+    if sample["bin_rel"] != "7" or sample["bin_url"].endswith("-1-x86_64.pkg.tar.zst"):
+        raise SystemExit("self-check: upstream pkgrel was assumed to be 1")
+    if sample["appimage_sha256"] != "b" * 64 or "SKIP" in sample["bin_sha256"]:
+        raise SystemExit("self-check: hearthstone checksum pin")
     print("self-check ok")
 
 

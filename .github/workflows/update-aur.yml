@@ -27,6 +27,8 @@ on:
       - "memprocfs/**"
       - "moonbit-bin/**"
       - "mfile-bin/**"
+      - "hearthstone-linux-gui-bin/**"
+      - "hearthstone-linux-gui-appimage/**"
       - "cuda-api-wrappers-git/**"
       - "reflectcpp-git/**"
       - "nvchecker.toml"
@@ -62,14 +64,18 @@ jobs:
           - package: mfile-bin
             timeout: 45
             free_disk: false
+          - package: hearthstone-linux-gui-bin
+            timeout: 60
+            free_disk: false
+          - package: hearthstone-linux-gui-appimage
+            timeout: 45
+            free_disk: false
           - package: cuda-api-wrappers-git
             timeout: 180
             free_disk: true
           - package: reflectcpp-git
             timeout: 120
             free_disk: false
-          # hearthstone-linux-gui-bin and hearthstone-linux-gui-appimage are
-          # prepared in this repo but omitted until those AUR packages are adopted.
           # asus-fa401km-acpi-fix has no upstream version and is not updated.
 
     steps:
@@ -197,6 +203,12 @@ jobs:
             timeout: 60
             free_disk: false
           - package: mfile-bin
+            timeout: 45
+            free_disk: false
+          - package: hearthstone-linux-gui-bin
+            timeout: 60
+            free_disk: false
+          - package: hearthstone-linux-gui-appimage
             timeout: 45
             free_disk: false
           - package: cuda-api-wrappers-git

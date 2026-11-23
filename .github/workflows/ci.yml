@@ -1,8 +1,8 @@
 name: CI
 
-# Pull-request checks. This does not publish and does not run the update
-# flow for any package except a read-only detection of mfile-bin.
-# update-aur.yml remains the only workflow that builds or publishes.
+# Pull-request checks. This does not publish. It runs a read-only detection
+# of mfile-bin and the two hearthstone packages only. update-aur.yml remains
+# the only workflow that builds or publishes.
 
 on:
   pull_request:
@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   test:
-    name: tests and mfile-bin detection
+    name: tests and release detection
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -58,3 +58,25 @@ jobs:
               raise SystemExit(f"unexpected AUR names for mfile-bin: {names}")
           print("AUR mfile-bin lookup:", names or "absent (not the unrelated package mfile)")
           PY
+
+      - name: Detect hearthstone upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Read-only. These packages already exist on the AUR; this does not publish.
+          for pkg in hearthstone-linux-gui-bin hearthstone-linux-gui-appimage; do
+            python3 scripts/update_package.py "$pkg" >"$RUNNER_TEMP/$pkg.out" 2>"$RUNNER_TEMP/$pkg.err"
+            cat "$RUNNER_TEMP/$pkg.err"
+            cat "$RUNNER_TEMP/$pkg.out"
+            if grep -Eq '^changed=(true|false)$' "$RUNNER_TEMP/$pkg.out"; then
+              echo "$pkg: $(grep '^changed=' "$RUNNER_TEMP/$pkg.out")"
+            else
+              echo "$pkg detection did not report changed" >&2
+              exit 1
+            fi
+            if grep -q SKIP "$pkg/PKGBUILD"; then
+              echo "$pkg PKGBUILD contains SKIP" >&2
+              exit 1
+            fi
+          done

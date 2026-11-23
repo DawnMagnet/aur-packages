@@ -38,12 +38,14 @@ def no_nvchecker(name: str):
     raise AssertionError("read-only mode must not run nvchecker")
 
 
+# Newer than the committed memprocfs PKGBUILD so the host-version downgrade
+# check still lets this fixture through after upstream moves.
 MEMPROCFS_INFO = {
-    "pkgver": "5.19.1",
-    "pkgrel": "20261101",
-    "tag": "v5.19.1",
-    "x86_64": "https://github.com/ufrisk/MemProcFS/releases/download/v5.19.1/MemProcFS_files_and_binaries_v5.19.1-linux_x64-20261101.tar.gz",
-    "aarch64": "https://github.com/ufrisk/MemProcFS/releases/download/v5.19.1/MemProcFS_files_and_binaries_v5.19.1-linux_aarch64-20261101.tar.gz",
+    "pkgver": "5.20.0",
+    "pkgrel": "20261120",
+    "tag": "v5.20.0",
+    "x86_64": "https://github.com/ufrisk/MemProcFS/releases/download/v5.20.0/MemProcFS_files_and_binaries_v5.20.0-linux_x64-20261120.tar.gz",
+    "aarch64": "https://github.com/ufrisk/MemProcFS/releases/download/v5.20.0/MemProcFS_files_and_binaries_v5.20.0-linux_aarch64-20261120.tar.gz",
 }
 
 
@@ -200,7 +202,7 @@ class ExpectedReleaseTest(Base):
         main = (self.root / "memprocfs/PKGBUILD").read_text(encoding="utf-8")
         with mock.patch.object(up, "probe_memprocfs", lambda: MEMPROCFS_INFO):
             ver, rel, text = up.expected_release_pkgbuild("memprocfs", main)
-        self.assertEqual((ver, rel), ("5.19.1", "20261101"))
+        self.assertEqual((ver, rel), ("5.20.0", "20261120"))
         self.assertEqual(
             gate.parse_sources("memprocfs", text),
             {"source_x86_64": [MEMPROCFS_INFO["x86_64"]], "source_aarch64": [MEMPROCFS_INFO["aarch64"]]},
@@ -367,6 +369,74 @@ class ExpectReleaseTest(Base):
         ):
             up.expected_release("mfile-bin", main)
         self.assertEqual(seen, [("DawnMagnet/mfile", "v")])
+
+    def test_hearthstone_asset_rel_is_taken_from_the_release(self) -> None:
+        info = {
+            "pkgver": "0.4.1",
+            "bin_rel": "2",
+            "bin_asset": "hearthstone-linux-gui-0.4.1-2-x86_64.pkg.tar.zst",
+            "bin_url": "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.4.1/hearthstone-linux-gui-0.4.1-2-x86_64.pkg.tar.zst",
+            "bin_sha256": "a" * 64,
+            "appimage_asset": "hearthstone-linux-gui-0.4.1-x86_64.AppImage",
+            "appimage_url": "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.4.1/hearthstone-linux-gui-0.4.1-x86_64.AppImage",
+            "appimage_sha256": "b" * 64,
+        }
+        main = (self.root / "hearthstone-linux-gui-bin/PKGBUILD").read_text(encoding="utf-8")
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.4.1"), mock.patch.object(
+            up, "hearthstone_release", lambda pkgver: info
+        ):
+            ver, rel, text = up.expected_release_pkgbuild("hearthstone-linux-gui-bin", main)
+        self.assertEqual((ver, rel), ("0.4.1", up.read_var(main, "pkgrel")))
+        sources = gate.parse_sources("hearthstone-linux-gui-bin", text)
+        self.assertEqual(sources["source"], [info["bin_url"]])
+        self.assertNotIn("-1-x86_64.pkg.tar.zst", info["bin_url"])
+        self.assertIn("-2-x86_64.pkg.tar.zst", sources["source"][0])
+        self.assertEqual(gate.parse_checksums("hearthstone-linux-gui-bin", text)["sha256sums"], ["a" * 64])
+        art = self.artifact(text)
+        before = tree_digest(self.root)
+
+        def fetch(url: str) -> str:
+            if url != info["bin_url"]:
+                gate.die(f"unexpected download {url}")
+            return info["bin_sha256"]
+
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.4.1"), mock.patch.object(
+            up, "hearthstone_release", lambda pkgver: info
+        ):
+            gate.expect_release("hearthstone-linux-gui-bin", art, self.root / "hearthstone-linux-gui-bin/PKGBUILD", fetch)
+        outs = self.outputs()
+        self.assertEqual(outs["pkgver"], "0.4.1")
+        self.assertEqual(json.loads(outs["sha256sums"]), {"sha256sums": ["a" * 64]})
+        self.assertEqual(json.loads(outs["sources"])["source"], [info["bin_url"]])
+        self.assertEqual(tree_digest(self.root), before)
+        self.out.write_text("", encoding="utf-8")
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.4.1"), mock.patch.object(
+            up, "hearthstone_release", lambda pkgver: info
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                gate.expect_release(
+                    "hearthstone-linux-gui-bin", art, self.root / "hearthstone-linux-gui-bin/PKGBUILD", FakeFetch()
+                )
+        self.assertIn("does not match SHA256SUMS.txt", str(caught.exception))
+        self.assertFalse(self.out.exists() and "sha256sums=" in self.out.read_text(encoding="utf-8"))
+
+    def test_hearthstone_version_bump_resets_pkgrel(self) -> None:
+        info = {
+            "pkgver": "0.5.0",
+            "bin_url": "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.5.0/hearthstone-linux-gui-0.5.0-3-x86_64.pkg.tar.zst",
+            "bin_sha256": "d" * 64,
+            "appimage_url": "https://github.com/DawnMagnet/hearthstone-linux-gui/releases/download/v0.5.0/hearthstone-linux-gui-0.5.0-x86_64.AppImage",
+            "appimage_sha256": "e" * 64,
+        }
+        main = (self.root / "hearthstone-linux-gui-appimage/PKGBUILD").read_text(encoding="utf-8")
+        with mock.patch.object(up, "stable_github_version", lambda repo, prefix: "0.5.0"), mock.patch.object(
+            up, "nvchecker_version", lambda name: (_ for _ in ()).throw(AssertionError("nvchecker must not run"))
+        ), mock.patch.object(up, "hearthstone_release", lambda pkgver: info):
+            ver, rel, text = up.expected_release_pkgbuild("hearthstone-linux-gui-appimage", main)
+        self.assertEqual((ver, rel), ("0.5.0", "1"))
+        self.assertEqual(gate.parse_sources("hearthstone-linux-gui-appimage", text)["source"], [info["appimage_url"]])
+        self.assertEqual(gate.parse_checksums("hearthstone-linux-gui-appimage", text)["sha256sums"], ["e" * 64])
+        self.assertNotIn("SKIP", text)
 
     def test_refuses_git_packages_and_wrong_main(self) -> None:
         art = self.artifact(f"pkgname=reflectcpp-git\npkgver=1.r0.gabcdef1\npkgrel=1\nsha256sums=('{H1}')\n")
@@ -542,7 +612,16 @@ class SourceLockTest(unittest.TestCase):
             )
 
 
-ALL_PACKAGES = ("maple-mono-nf-cn", "memprocfs", "moonbit-bin", "mfile-bin", "cuda-api-wrappers-git", "reflectcpp-git")
+ALL_PACKAGES = (
+    "maple-mono-nf-cn",
+    "memprocfs",
+    "moonbit-bin",
+    "mfile-bin",
+    "hearthstone-linux-gui-bin",
+    "hearthstone-linux-gui-appimage",
+    "cuda-api-wrappers-git",
+    "reflectcpp-git",
+)
 
 
 def bump_ver(package: str, ver: str) -> str:
@@ -676,7 +755,7 @@ class VersionRuleTest(unittest.TestCase):
                 self.import_full(package, main, main, ver, up.read_var(main, "pkgrel"))
 
     def test_import_rejects_pkgver_99999_for_release_packages(self) -> None:
-        for package in ("moonbit-bin", "maple-mono-nf-cn", "memprocfs", "mfile-bin"):
+        for package in up.RELEASE_PACKAGES:
             main = self.real(package)
             ver, rel = up.read_var(main, "pkgver"), up.read_var(main, "pkgrel")
             with self.subTest(package=package):
